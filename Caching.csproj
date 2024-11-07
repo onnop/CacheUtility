@@ -1,24 +1,27 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
     <GeneratePackageOnBuild>True</GeneratePackageOnBuild>
-    <Version>1.0.2</Version>
+    <Version>1.0.3</Version>
     <Title>Threadsafe and simplified generic System.Runtime.Caching wrapper, supporting easy caching patterns.</Title>
     <Authors>Onno Pistorius</Authors>
     <Company>Athena ICT</Company>
-    <Description>Add objects to the Cache and retreive an object later by it's corresponding Key. Delete items by Key, or the Group name the item belongs to.
+    <Description>This CacheUtility is a threadsafe and simplified generic System.Runtime.Caching wrapper, supporting easy caching patterns.
+
+Add objects to the Cache and retreive an object later by it's corresponding Key. Delete items by Key, or the Group name the item belongs to.
 A populate method will fill the cache if the object is not yet created, or has expired meanwhile.</Description>
     <Copyright>Onno Pistorius</Copyright>
     <PackageProjectUrl>https://www.athenaict.com/NuGet/Cache</PackageProjectUrl>
     <PackageIcon>Logo_initials.png</PackageIcon>
-    <PackageTags>cache;caching;memory;performance;</PackageTags>
+    <PackageTags>cache;caching;memory;performance;in-memory;scalability;cache-management;caching-strategy;high-performance;cache-layer;object-caching;application-performance;Cache Utility;</PackageTags>
     <PackageReleaseNotes>Initial release</PackageReleaseNotes>
     <PackageId>CacheUtility</PackageId>
     <Product>CacheUtility</Product>
     <PackageLicenseFile>License.txt</PackageLicenseFile>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <SignAssembly>False</SignAssembly>
+    <RepositoryUrl>https://github.com/onnop/CacheUtility</RepositoryUrl>
   </PropertyGroup>
 
   <ItemGroup>
