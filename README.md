@@ -1,6 +1,10 @@
-﻿**Example:**
+﻿# CacheUtility
 
-Add the result of calling the function "MyLongRunningTaskAsync" and add it to the cache. The next time this code is called, the result object is retreived from the cache and the function "MyLongRunningTaskAsync" is not invoked.
+This CacheUtility is a threadsafe and simplified generic System.Runtime.Caching wrapper, supporting easy caching patterns.
+
+**Example:**
+
+Add the result of calling the function "MyLongRunningTaskAsync" (like a database query) and add it to the cache. The next time this code is called, the result object is retreived from the cache and the function "MyLongRunningTaskAsync" is not invoked.
 
 ```csharp
 var result = await CacheUtility.Get("MyKey", "MyGroupName", () =>
