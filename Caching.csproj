@@ -1,9 +1,9 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
+    <TargetFramework>net9.0</TargetFramework>
     <GeneratePackageOnBuild>True</GeneratePackageOnBuild>
-    <Version>1.0.3</Version>
+    <Version>1.0.4</Version>
     <Title>Threadsafe and simplified generic System.Runtime.Caching wrapper, supporting easy caching patterns.</Title>
     <Authors>Onno Pistorius</Authors>
     <Company>Athena ICT</Company>
@@ -14,8 +14,8 @@ A populate method will fill the cache if the object is not yet created, or has e
     <Copyright>Onno Pistorius</Copyright>
     <PackageProjectUrl>https://www.athenaict.com/NuGet/Cache</PackageProjectUrl>
     <PackageIcon>Logo_initials.png</PackageIcon>
-    <PackageTags>cache;caching;memory;performance;in-memory;scalability;cache-management;caching-strategy;high-performance;cache-layer;object-caching;application-performance;Cache Utility;</PackageTags>
-    <PackageReleaseNotes>Initial release</PackageReleaseNotes>
+    <PackageTags>cache;caching;memory;performance;in-memory;scalability;cache-management;caching-strategy;high-performance;cache-layer;object-caching;application-performance;Cache-Utility;</PackageTags>
+    <PackageReleaseNotes>Support for .Net 9.0</PackageReleaseNotes>
     <PackageId>CacheUtility</PackageId>
     <Product>CacheUtility</Product>
     <PackageLicenseFile>License.txt</PackageLicenseFile>
