@@ -288,6 +288,7 @@ namespace Caching
                     {
                         MemoryCache.Default.Remove(keys[i]);
                     }
+
                 }
 
                 if (!_dependencies.TryGetValue(groupName, out var dependencies))
@@ -356,3 +357,4 @@ namespace Caching
 
     }
 }
+
