@@ -3,7 +3,7 @@
   <PropertyGroup>
     <TargetFramework>net9.0</TargetFramework>
     <GeneratePackageOnBuild>True</GeneratePackageOnBuild>
-    <Version>1.0.4</Version>
+    <Version>1.0.5</Version>
     <Title>Threadsafe and simplified generic System.Runtime.Caching wrapper, supporting easy caching patterns.</Title>
     <Authors>Onno Pistorius</Authors>
     <Company>Athena ICT</Company>
