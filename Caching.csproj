@@ -15,7 +15,7 @@ A populate method will fill the cache if the object is not yet created, or has e
     <PackageProjectUrl>https://www.athenaict.com/NuGet/Cache</PackageProjectUrl>
     <PackageIcon>Logo_initials.png</PackageIcon>
     <PackageTags>cache;caching;memory;performance;in-memory;scalability;cache-management;caching-strategy;high-performance;cache-layer;object-caching;application-performance;Cache-Utility;</PackageTags>
-    <PackageReleaseNotes>Support for .Net 9.0</PackageReleaseNotes>
+    <PackageReleaseNotes>Support for .Net 9.0 and updated the README.md file</PackageReleaseNotes>
     <PackageId>CacheUtility</PackageId>
     <Product>CacheUtility</Product>
     <PackageLicenseFile>License.txt</PackageLicenseFile>
