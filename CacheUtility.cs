@@ -4,7 +4,7 @@ using System.Linq;
 using System.Runtime.Caching;
 using System.Threading;
 
-namespace Caching
+namespace CacheUtility
 {
     /// <summary>
     /// Threadsafe generic System.Runtime.Caching wrapper. Simplified System.Runtime.Caching cache access and supports easy caching patterns.
