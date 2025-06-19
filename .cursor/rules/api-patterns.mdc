@@ -1,0 +1,101 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+# CacheUtility API Patterns
+
+## Core API Design Patterns
+
+### Cache Key Management
+The Cache class uses internal key combination pattern from [CacheUtility.cs](mdc:CacheUtility.cs):
+```csharp
+// Pattern: Combine group name with cache key
+cacheKey = string.Format("{0}_{1}", groupName, cacheKey);
+```
+
+### Method Overloading Strategy
+The Cache class provides multiple overloads for flexibility:
+1. Basic usage with defaults: `Get<TData>(key, group, populateMethod)`
+2. With sliding expiration: `Get<TData>(key, group, slidingExpiration, populateMethod)`
+3. With absolute expiration: `Get<TData>(key, group, absoluteExpiration, populateMethod)`
+4. Full control: `Get<TData>(key, group, absoluteExpiration, slidingExpiration, priority, populateMethod)`
+
+### Populate Method Pattern
+All Get methods use `Func<TData> populateMethod` for lazy loading:
+- Method is only called when item is not in cache or expired
+- Supports both synchronous and asynchronous operations
+- Return value is automatically cached with specified expiration
+
+### Group-Based Operations
+Cache groups enable bulk operations:
+- Items are organized by group names
+- Groups can have dependencies on other groups
+- Removing a group removes all its items and dependent groups
+- `GetAllByGroup()` retrieves all items from a specific group
+
+## Extension Guidelines
+
+### Adding New Cache Methods
+When adding new methods to the Cache class:
+1. Follow parameter validation pattern (null checks with ArgumentNullException)
+2. Use internal key combination for group/key pairing
+3. Implement proper locking using established patterns
+4. Add corresponding unit tests following [GetAllByGroupTests.cs](mdc:CacheUtility.Tests/GetAllByGroupTests.cs) patterns
+
+### Cache Group Features
+When working with cache groups:
+- Always update `RegisteredGroups` dictionary when adding items
+- Handle group dependencies through `_dependencies` dictionary
+- Use recursive removal for dependent groups
+- Maintain thread safety during group operations
+
+### Data Type Handling
+The cache supports any .NET type through generics:
+- Wrap cached items in `CacheItem<T>` internally
+- Support value types, reference types, and complex objects
+- Handle null values appropriately
+- Ensure serialization compatibility if needed
+
+## Testing Patterns
+
+### Test Structure (from [GetAllByGroupTests.cs](mdc:CacheUtility.Tests/GetAllByGroupTests.cs))
+```csharp
+public class FeatureTests : IDisposable
+{
+    public FeatureTests()
+    {
+        Cache.RemoveAll(); // Clean start
+    }
+
+    public void Dispose()
+    {
+        Cache.RemoveAll(); // Clean end
+        Cache.Dispose();
+    }
+}
+```
+
+### Test Scenarios to Cover
+- Valid input scenarios
+- Edge cases (empty groups, null parameters)
+- Data type variations
+- Thread safety scenarios
+- Group dependency behavior
+- Expiration handling
+
+## Integration Points
+
+### System.Runtime.Caching Integration
+The Cache class wraps `MemoryCache.Default`:
+- Uses `CacheItemPolicy` for expiration settings
+- Handles `CacheItemPriority` appropriately
+- Manages cache item lifecycle through System.Runtime.Caching events
+
+### Documentation Updates
+When adding features, update:
+- XML documentation in code
+- [README.md](mdc:README.md) with usage examples
+- [CacheUtility.csproj](mdc:CacheUtility.csproj) release notes
+- Package version and tags as needed
+

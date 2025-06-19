@@ -1,0 +1,61 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+# CacheUtility Coding Standards
+
+## C# Style Guidelines
+
+### Naming Conventions
+- Follow established patterns in [CacheUtility.cs](mdc:CacheUtility.cs):
+  - Private static fields use camelCase with underscore prefix: `_dependencies`, `CacheLock`
+  - Private fields use PascalCase: `RegisteredKeys`, `RegisteredGroups`
+  - Public methods use PascalCase: `Get`, `Remove`, `RemoveGroup`
+  - Generic type parameters use T prefix: `TData`
+  - Parameters use camelCase: `cacheKey`, `groupName`, `populateMethod`
+
+### Method Documentation
+- All public methods must have XML documentation comments
+- Include `<summary>`, `<param>`, and `<returns>` tags
+- Follow the documentation style established in the main Cache class
+- Document exceptions with `<exception>` tags
+
+### Error Handling
+- Validate parameters at method entry points:
+  - Use `ArgumentNullException` for null parameters
+  - Use descriptive parameter names in exceptions: `nameof(cacheKey)`
+- Follow the validation pattern from existing Get methods
+
+### Thread Safety
+- All operations must be thread-safe
+- Use the established locking patterns:
+  - `CacheLock` for cache structure modifications
+  - `ReaderWriterLockSlim` for per-key operations
+  - Always use try/finally blocks with locks
+
+### Generic Methods
+- Use meaningful generic constraints where applicable
+- Follow the pattern of `TData` for data types
+- Ensure generic methods work with all .NET types including value types and reference types
+
+## Project Structure Standards
+
+### Test Organization
+- Tests should be in [CacheUtility.Tests/](mdc:CacheUtility.Tests) directory
+- Each test class should implement `IDisposable` for cleanup
+- Use `Cache.RemoveAll()` in setup and teardown like in [GetAllByGroupTests.cs](mdc:CacheUtility.Tests/GetAllByGroupTests.cs)
+- Follow Arrange-Act-Assert pattern
+
+### NuGet Package Configuration
+- Update version in [CacheUtility.csproj](mdc:CacheUtility.csproj) for releases
+- Maintain comprehensive PackageReleaseNotes
+- Keep PackageTags relevant and searchable
+- Update documentation references when making API changes
+
+## Performance Considerations
+- Minimize lock contention by keeping critical sections small
+- Use read locks where possible before write locks
+- Cache internal key combinations to avoid string concatenation in hot paths
+- Consider memory usage when implementing new cache features
+

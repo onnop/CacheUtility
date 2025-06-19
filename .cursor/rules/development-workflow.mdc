@@ -1,0 +1,147 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+# CacheUtility Development Workflow
+
+## Building the Project
+
+### Prerequisites
+- .NET 9.0 SDK
+- Visual Studio or VS Code with C# extension
+- NuGet CLI (for package operations)
+
+### Build Commands
+```bash
+# Build the solution
+dotnet build CacheUtility.sln
+
+# Build with specific configuration
+dotnet build --configuration Release
+
+# Run tests
+dotnet test CacheUtility.Tests/
+
+# Pack NuGet package
+dotnet pack --configuration Release
+```
+
+## Testing Strategy
+
+### Unit Test Execution
+Tests are located in [CacheUtility.Tests/](mdc:CacheUtility.Tests) directory:
+```bash
+# Run all tests
+dotnet test
+
+# Run with detailed output
+dotnet test --logger "console;verbosity=detailed"
+
+# Test specific class/method
+dotnet test --filter "GetAllByGroupTests"
+```
+
+### Test Coverage Areas
+Based on [GetAllByGroupTests.cs](mdc:GetAllByGroupTests.cs):
+1. **Functional Testing**: Core cache operations work correctly
+2. **Edge Case Testing**: Empty groups, null parameters
+3. **Data Type Testing**: Various .NET types (string, int, DateTime, collections)
+4. **Cleanup Testing**: Cache removal and disposal
+5. **Thread Safety Testing**: Concurrent access scenarios
+
+### Adding New Tests
+Follow the established pattern:
+1. Inherit from `IDisposable`
+2. Clean cache in constructor and `Dispose()`
+3. Use descriptive test method names
+4. Follow Arrange-Act-Assert pattern
+5. Test both positive and negative scenarios
+
+## Release Process
+
+### Version Management
+Update version in [CacheUtility.csproj](mdc:CacheUtility.csproj):
+1. Increment `<Version>` appropriately (major.minor.patch)
+2. Update `<PackageReleaseNotes>` with changes
+3. Review and update `<PackageTags>` if needed
+4. Ensure `<Description>` reflects current capabilities
+
+### Pre-Release Checklist
+1. **Code Quality**:
+   - All unit tests pass
+   - Code follows established patterns in [CacheUtility.cs](mdc:CacheUtility.cs)
+   - XML documentation is complete
+   - No linter warnings
+
+2. **Documentation**:
+   - [README.md](mdc:README.md) reflects new features
+   - Code examples are tested and working
+   - API documentation is current
+
+3. **Package Configuration**:
+   - Package metadata is accurate
+   - License file ([License.txt](mdc:License.txt)) is included
+   - Logo and readme files are properly referenced
+
+### NuGet Package Creation
+```bash
+# Create package
+dotnet pack --configuration Release --output ./nupkg
+
+# Test package locally
+dotnet add package CacheUtility --source ./nupkg
+
+# Publish to NuGet (requires API key)
+dotnet nuget push ./nupkg/*.nupkg --source https://api.nuget.org/v3/index.json --api-key YOUR_API_KEY
+```
+
+## Development Best Practices
+
+### Code Changes
+1. **Single Responsibility**: Each method should have a clear purpose
+2. **Backward Compatibility**: Avoid breaking existing API contracts
+3. **Performance**: Consider cache performance implications
+4. **Thread Safety**: Maintain thread-safe operations
+
+### Git Workflow
+1. Create feature branches for new functionality
+2. Write tests before implementing features (TDD approach)
+3. Keep commits focused and well-documented
+4. Test thoroughly before merging to main branch
+
+### Performance Testing
+When making changes that could affect performance:
+1. Create benchmarks for critical paths
+2. Test with realistic data sizes
+3. Monitor memory usage and garbage collection
+4. Test concurrent access scenarios
+
+## Debugging Guidelines
+
+### Common Issues
+1. **Thread Deadlocks**: Check lock ordering and release
+2. **Memory Leaks**: Ensure proper disposal of ReaderWriterLockSlim
+3. **Cache Misses**: Verify key combination logic
+4. **Group Dependencies**: Check recursive removal logic
+
+### Debugging Tools
+- Use debugger breakpoints in cache operations
+- Monitor MemoryCache.Default statistics
+- Use performance profilers for memory analysis
+- Enable trace logging for lock operations (commented code in [CacheUtility.cs](mdc:CacheUtility.cs))
+
+## Documentation Maintenance
+
+### Keep Updated
+- API documentation in code comments
+- Usage examples in [README.md](mdc:README.md)
+- Release notes in project file
+- Package tags and description for discoverability
+
+### Review Process
+- Test all documented examples
+- Verify code samples compile and work
+- Ensure documentation matches current API
+- Update version-specific information
+
