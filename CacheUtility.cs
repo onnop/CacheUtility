@@ -355,6 +355,53 @@ namespace CacheUtility
             RegisteredKeys.Clear();
         }
 
+        /// <summary>
+        /// Retrieve all cached items from a specific group
+        /// </summary>
+        /// <param name="groupName">The name of the cache group</param>
+        /// <returns>Dictionary containing the original cache keys (without group prefix) and their cached values</returns>
+        public static Dictionary<string, object> GetAllByGroup(string groupName)
+        {
+            if (string.IsNullOrEmpty(groupName)) throw new ArgumentNullException(nameof(groupName));
+
+            var result = new Dictionary<string, object>();
+
+            lock (CacheLock)
+            {
+                if (!RegisteredGroups.TryGetValue(groupName, out var group))
+                {
+                    return result; // Return empty dictionary if group doesn't exist
+                }
+
+                foreach (var fullCacheKey in group.SubKeys)
+                {
+                    var cachedItem = MemoryCache.Default.Get(fullCacheKey);
+                    if (cachedItem != null)
+                    {
+                        // Extract the original cache key by removing the group prefix
+                        var originalKey = fullCacheKey.Substring(groupName.Length + 1); // +1 for the underscore
+
+                        // Extract the actual item from the CacheItem wrapper
+                        if (cachedItem.GetType().IsGenericType &&
+                            cachedItem.GetType().GetGenericTypeDefinition() == typeof(CacheItem<>))
+                        {
+                            var itemProperty = cachedItem.GetType().GetProperty("Item");
+                            if (itemProperty != null)
+                            {
+                                result[originalKey] = itemProperty.GetValue(cachedItem);
+                            }
+                        }
+                        else
+                        {
+                            result[originalKey] = cachedItem;
+                        }
+                    }
+                }
+            }
+
+            return result;
+        }
+
     }
 }
 

@@ -58,6 +58,26 @@ var result = await CacheUtility.Get("MyKey", "MyGroupName", async () =>
 
 ## Cache Management
 
+### Retrieving All Items from a Group
+
+Get all cached items that belong to a specific group:
+
+```csharp
+var allItems = CacheUtility.GetAllByGroup("MyGroupName");
+
+// Iterate through all items in the group
+foreach (var kvp in allItems)
+{
+    Console.WriteLine($"Key: {kvp.Key}, Value: {kvp.Value}");
+}
+
+// Access specific items if you know the key
+if (allItems.ContainsKey("MySpecificKey"))
+{
+    var specificItem = allItems["MySpecificKey"];
+}
+```
+
 ### Removing Individual Items
 
 Remove a specific item from the cache:
@@ -147,6 +167,25 @@ CacheUtility.SetDependencies("UserProfiles", "ProfilePhotos");
 // Now when UserData is cleared, all dependent caches are also cleared
 CacheUtility.RemoveGroup("UserData");
 // This will clear UserData, UserProfiles, ProfilePhotos, UserPreferences, and UserActivity
+```
+
+### Retrieving Multiple Cached Items
+
+```csharp
+// Cache some user data
+CacheUtility.Get("User1", "UserData", () => GetUserInfo(1));
+CacheUtility.Get("User2", "UserData", () => GetUserInfo(2));
+CacheUtility.Get("User3", "UserData", () => GetUserInfo(3));
+
+// Get all cached items from the group
+var allUsers = CacheUtility.GetAllByGroup("UserData");
+Console.WriteLine($"Found {allUsers.Count} cached users");
+
+// Process each cached item
+foreach (var user in allUsers)
+{
+    Console.WriteLine($"User Key: {user.Key}, Data: {user.Value}");
+}
 ```
 
 ## Best Practices
