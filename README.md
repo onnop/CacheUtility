@@ -14,31 +14,36 @@ CacheUtility provides an easy-to-use abstraction over the standard .NET memory c
 
 ## Basic Usage
 
+**Note:** All examples assume you have added the using statement:
+```csharp
+using CacheUtility;
+```
+
 ### Retrieving or Creating Cached Items
 
 The most common pattern is to request an item from the cache, providing a function to generate the item if it doesn't exist:
 
 ```csharp
 // Basic usage with default 30-minute sliding expiration
-var result = CacheUtility.Get("MyKey", "MyGroupName", () => 
+var result = Cache.Get("MyKey", "MyGroupName", () => 
 {
     return MyLongRunningTask();
 });
 
 // With custom sliding expiration
-var result = CacheUtility.Get("MyKey", "MyGroupName", TimeSpan.FromHours(1), () => 
+var result = Cache.Get("MyKey", "MyGroupName", TimeSpan.FromHours(1), () => 
 {
     return MyLongRunningTask();
 });
 
 // With absolute expiration
-var result = CacheUtility.Get("MyKey", "MyGroupName", DateTime.Now.AddDays(1), () => 
+var result = Cache.Get("MyKey", "MyGroupName", DateTime.Now.AddDays(1), () => 
 {
     return MyLongRunningTask();
 });
 
 // With full customization
-var result = CacheUtility.Get("MyKey", "MyGroupName", 
+var result = Cache.Get("MyKey", "MyGroupName", 
     DateTime.Now.AddDays(1), // Absolute expiration
     TimeSpan.FromMinutes(10), // Sliding expiration
     CacheItemPriority.Default, // Priority
@@ -50,7 +55,7 @@ var result = CacheUtility.Get("MyKey", "MyGroupName",
 For async operations, you can use the utility with async/await:
 
 ```csharp
-var result = await CacheUtility.Get("MyKey", "MyGroupName", async () => 
+var result = await Cache.Get("MyKey", "MyGroupName", async () => 
 {
     return await MyLongRunningTaskAsync();
 });
@@ -58,12 +63,43 @@ var result = await CacheUtility.Get("MyKey", "MyGroupName", async () =>
 
 ## Cache Management
 
+### Removing Individual Items
+
+Remove a specific item from the cache:
+
+```csharp
+Cache.Remove("MyKey", "MyGroupName");
+```
+
+### Removing Multiple Items
+
+Remove multiple items that contain specific strings:
+
+```csharp
+Cache.Remove(new List<string> { "UserProfile", "123" }, "UserData");
+// This will remove any cache key containing both "UserProfile" and "123"
+```
+
+### Group Operations
+
+Remove an entire group of cached items:
+
+```csharp
+Cache.RemoveGroup("MyGroupName");
+```
+
+Remove multiple groups:
+
+```csharp
+Cache.RemoveGroup("GroupA", "GroupB", "GroupC");
+```
+
 ### Retrieving All Items from a Group
 
 Get all cached items that belong to a specific group:
 
 ```csharp
-var allItems = CacheUtility.GetAllByGroup("MyGroupName");
+var allItems = Cache.GetAllByGroup("MyGroupName");
 
 // Iterate through all items in the group
 foreach (var kvp in allItems)
@@ -78,36 +114,21 @@ if (allItems.ContainsKey("MySpecificKey"))
 }
 ```
 
-### Removing Individual Items
+### Global Cache Operations
 
-Remove a specific item from the cache:
-
-```csharp
-CacheUtility.Remove("MyKey", "MyGroupName");
-```
-
-### Removing Multiple Items
-
-Remove multiple items that contain specific strings:
+Clear the entire cache:
 
 ```csharp
-CacheUtility.Remove(new List<string> { "UserProfile", "123" }, "UserData");
-// This will remove any cache key containing both "UserProfile" and "123"
+Cache.RemoveAll();
 ```
 
-### Group Operations
-
-Remove an entire group of cached items:
+Clear the cache except for specific groups:
 
 ```csharp
-CacheUtility.RemoveGroup("MyGroupName");
+Cache.RemoveAllButThese(new List<string> { "CriticalData", "ApplicationSettings" });
 ```
 
-Remove multiple groups:
-
-```csharp
-CacheUtility.RemoveGroup("GroupA", "GroupB", "GroupC");
-```
+## Advanced Features
 
 ### Cache Dependencies
 
@@ -115,33 +136,19 @@ Set up dependencies between cache groups so that when one group is cleared, its 
 
 ```csharp
 // Set up dependencies
-CacheUtility.SetDependencies("ParentGroup", "ChildGroup1", "ChildGroup2");
+Cache.SetDependencies("ParentGroup", "ChildGroup1", "ChildGroup2");
 
 // Now when ParentGroup is removed, ChildGroup1 and ChildGroup2 will also be removed
-CacheUtility.RemoveGroup("ParentGroup");
+Cache.RemoveGroup("ParentGroup");
 ```
 
-### Global Cache Operations
-
-Clear the entire cache:
-
-```csharp
-CacheUtility.RemoveAll();
-```
-
-Clear the cache except for specific groups:
-
-```csharp
-CacheUtility.RemoveAllButThese(new List<string> { "CriticalData", "ApplicationSettings" });
-```
-
-## Advanced Examples
+## Practical Examples
 
 ### Caching User Data
 
 ```csharp
 // Cache user data with a sliding expiration
-var userData = CacheUtility.Get($"User_{userId}", "UserProfiles", TimeSpan.FromMinutes(30), () =>
+var userData = Cache.Get($"User_{userId}", "UserProfiles", TimeSpan.FromMinutes(30), () =>
 {
     return database.GetUserById(userId);
 });
@@ -151,34 +158,22 @@ var userData = CacheUtility.Get($"User_{userId}", "UserProfiles", TimeSpan.FromM
 
 ```csharp
 // Cache application settings with absolute expiration
-var settings = CacheUtility.Get("GlobalSettings", "AppConfig", DateTime.Now.AddHours(12), () =>
+var settings = Cache.Get("GlobalSettings", "AppConfig", DateTime.Now.AddHours(12), () =>
 {
     return configurationService.LoadSettings();
 });
 ```
 
-### Cascading Cache Invalidation
-
-```csharp
-// Set up dependencies
-CacheUtility.SetDependencies("UserData", "UserProfiles", "UserPreferences", "UserActivity");
-CacheUtility.SetDependencies("UserProfiles", "ProfilePhotos");
-
-// Now when UserData is cleared, all dependent caches are also cleared
-CacheUtility.RemoveGroup("UserData");
-// This will clear UserData, UserProfiles, ProfilePhotos, UserPreferences, and UserActivity
-```
-
-### Retrieving Multiple Cached Items
+### Working with Multiple Cached Items
 
 ```csharp
 // Cache some user data
-CacheUtility.Get("User1", "UserData", () => GetUserInfo(1));
-CacheUtility.Get("User2", "UserData", () => GetUserInfo(2));
-CacheUtility.Get("User3", "UserData", () => GetUserInfo(3));
+Cache.Get("User1", "UserData", () => GetUserInfo(1));
+Cache.Get("User2", "UserData", () => GetUserInfo(2));
+Cache.Get("User3", "UserData", () => GetUserInfo(3));
 
 // Get all cached items from the group
-var allUsers = CacheUtility.GetAllByGroup("UserData");
+var allUsers = Cache.GetAllByGroup("UserData");
 Console.WriteLine($"Found {allUsers.Count} cached users");
 
 // Process each cached item
@@ -186,6 +181,18 @@ foreach (var user in allUsers)
 {
     Console.WriteLine($"User Key: {user.Key}, Data: {user.Value}");
 }
+```
+
+### Cascading Cache Invalidation
+
+```csharp
+// Set up dependencies
+Cache.SetDependencies("UserData", "UserProfiles", "UserPreferences", "UserActivity");
+Cache.SetDependencies("UserProfiles", "ProfilePhotos");
+
+// Now when UserData is cleared, all dependent caches are also cleared
+Cache.RemoveGroup("UserData");
+// This will clear UserData, UserProfiles, ProfilePhotos, UserPreferences, and UserActivity
 ```
 
 ## Best Practices
