@@ -5,14 +5,14 @@ namespace CacheUtility.Tests
         public GetAllByGroupTests()
         {
             // Clean up cache before each test
-            CacheUtility.RemoveAll();
+            Cache.RemoveAll();
         }
 
         public void Dispose()
         {
             // Clean up cache after each test
-            CacheUtility.RemoveAll();
-            CacheUtility.Dispose();
+            Cache.RemoveAll();
+            Cache.Dispose();
         }
 
         [Fact]
@@ -20,12 +20,12 @@ namespace CacheUtility.Tests
         {
             // Arrange
             const string groupName = "TestGroup";
-            CacheUtility.Get("key1", groupName, () => "value1");
-            CacheUtility.Get("key2", groupName, () => "value2");
-            CacheUtility.Get("key3", groupName, () => "value3");
+            Cache.Get("key1", groupName, () => "value1");
+            Cache.Get("key2", groupName, () => "value2");
+            Cache.Get("key3", groupName, () => "value3");
 
             // Act
-            var result = CacheUtility.GetAllByGroup(groupName);
+            var result = Cache.GetAllByGroup(groupName);
 
             // Assert
             Assert.Equal(3, result.Count);
@@ -41,7 +41,7 @@ namespace CacheUtility.Tests
             const string groupName = "EmptyGroup";
 
             // Act
-            var result = CacheUtility.GetAllByGroup(groupName);
+            var result = Cache.GetAllByGroup(groupName);
 
             // Assert
             Assert.NotNull(result);
@@ -52,7 +52,7 @@ namespace CacheUtility.Tests
         public void GetAllByGroup_WithNullGroupName_ThrowsArgumentNullException()
         {
             // Act & Assert
-            Assert.Throws<ArgumentNullException>(() => CacheUtility.GetAllByGroup(null));
+            Assert.Throws<ArgumentNullException>(() => Cache.GetAllByGroup(null));
         }
 
         [Fact]
@@ -63,13 +63,13 @@ namespace CacheUtility.Tests
             var testDate = DateTime.Now;
             var testList = new List<string> { "A", "B", "C" };
 
-            CacheUtility.Get("stringKey", groupName, () => "Hello World");
-            CacheUtility.Get("intKey", groupName, () => 42);
-            CacheUtility.Get("dateKey", groupName, () => testDate);
-            CacheUtility.Get("listKey", groupName, () => testList);
+            Cache.Get("stringKey", groupName, () => "Hello World");
+            Cache.Get("intKey", groupName, () => 42);
+            Cache.Get("dateKey", groupName, () => testDate);
+            Cache.Get("listKey", groupName, () => testList);
 
             // Act
-            var result = CacheUtility.GetAllByGroup(groupName);
+            var result = Cache.GetAllByGroup(groupName);
 
             // Assert
             Assert.Equal(4, result.Count);
@@ -84,16 +84,16 @@ namespace CacheUtility.Tests
         {
             // Arrange
             const string groupName = "RemovalTestGroup";
-            CacheUtility.Get("key1", groupName, () => "value1");
-            CacheUtility.Get("key2", groupName, () => "value2");
+            Cache.Get("key1", groupName, () => "value1");
+            Cache.Get("key2", groupName, () => "value2");
 
             // Verify items are cached
-            var beforeRemoval = CacheUtility.GetAllByGroup(groupName);
+            var beforeRemoval = Cache.GetAllByGroup(groupName);
             Assert.Equal(2, beforeRemoval.Count);
 
             // Act
-            CacheUtility.RemoveGroup(groupName);
-            var afterRemoval = CacheUtility.GetAllByGroup(groupName);
+            Cache.RemoveGroup(groupName);
+            var afterRemoval = Cache.GetAllByGroup(groupName);
 
             // Assert
             Assert.NotNull(afterRemoval);

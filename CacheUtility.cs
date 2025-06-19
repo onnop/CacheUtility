@@ -9,7 +9,7 @@ namespace CacheUtility
     /// <summary>
     /// Threadsafe generic System.Runtime.Caching wrapper. Simplified System.Runtime.Caching cache access and supports easy caching patterns.
     /// </summary>
-    public abstract class CacheUtility
+    public abstract class Cache
     {
         /// <summary>
         /// Groups that depend on each other when removing from the cache
