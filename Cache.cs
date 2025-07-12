@@ -86,8 +86,9 @@ namespace CacheUtility
         /// <param name="slidingExpiration">Sliding expiration duration. If you are using an absolute expiration date, this has to be set to NoSlidingExpiration</param>
         /// <param name="priority">Caching priority</param>
         /// <param name="populateMethod">Populate method which is called when the item does not exist in the cache</param>
+        /// <param name="removedCallback">Optional callback method that is called when the cache item is removed</param>
         /// <returns>Cached or newly created object</returns>
-        public static TData Get<TData>(string cacheKey, string groupName, DateTime absoluteExpiration, TimeSpan slidingExpiration, CacheItemPriority priority, Func<TData> populateMethod)
+        public static TData Get<TData>(string cacheKey, string groupName, DateTime absoluteExpiration, TimeSpan slidingExpiration, CacheItemPriority priority, Func<TData> populateMethod, CacheEntryRemovedCallback removedCallback = null)
         {
             // Combine cachekey with the groupkey to create a unique key
             cacheKey = string.Format("{0}_{1}", groupName, cacheKey);
@@ -155,7 +156,8 @@ namespace CacheUtility
                             {
                                 AbsoluteExpiration = absoluteExpiration == DateTime.MaxValue ? DateTimeOffset.MaxValue : absoluteExpiration,
                                 SlidingExpiration = slidingExpiration,
-                                Priority = priority
+                                Priority = priority,
+                                RemovedCallback = removedCallback
                             };
 
                             MemoryCache.Default.Add(cacheKey, item, cacheItemPolicy);

@@ -128,6 +128,68 @@ Clear the cache except for specific groups:
 Cache.RemoveAllButThese(new List<string> { "CriticalData", "ApplicationSettings" });
 ```
 
+## Cache Removal Callbacks
+
+CacheUtility supports optional removal callbacks that are invoked when cached items are removed from the cache. This is useful for cleanup operations, logging, or triggering dependent actions.
+
+### Basic Removal Callback
+
+```csharp
+var result = Cache.Get("MyKey", "MyGroupName", 
+    DateTime.Now.AddHours(1), // Absolute expiration
+    TimeSpan.FromMinutes(10), // Or use Sliding expiration
+    CacheItemPriority.Default, // Priority
+    () => MyLongRunningTask(),
+    removedCallback: (args) => // Optional callback
+    {
+        Console.WriteLine($"Cache item removed. Key: {args.CacheItem.Key}, Reason: {args.RemovedReason}");
+    });
+```
+
+### Removal Reasons
+
+The callback provides a `CacheEntryRemovedArguments` object that contains:
+- `CacheItem`: The cache item that was removed
+- `RemovedReason`: The reason for removal (Removed, Expired, Evicted, ChangeMonitorChanged)
+
+Common removal reasons:
+- `Removed`: Item was explicitly removed
+- `Expired`: Item expired (absolute or sliding expiration)
+- `Evicted`: Item was evicted due to memory pressure
+- `ChangeMonitorChanged`: Item was removed due to a dependency change
+
+### Practical Callback Examples
+
+**Cleanup Resources:**
+```csharp
+var fileData = Cache.Get("FileData", "Files", 
+    TimeSpan.FromMinutes(30), 
+    CacheItemPriority.Default,
+    () => LoadFileData("myfile.txt"),
+    removedCallback: (args) =>
+    {
+        if (args.CacheItem.Value is IDisposable disposable)
+        {
+            disposable.Dispose();
+        }
+    });
+```
+
+**Trigger Dependent Operations:**
+```csharp
+var config = Cache.Get("AppConfig", "Configuration", 
+    DateTime.Now.AddHours(12), 
+    () => LoadConfiguration(),
+    removedCallback: (args) =>
+    {
+        // Refresh dependent services when configuration changes
+        if (args.RemovedReason == CacheEntryRemovedReason.Expired)
+        {
+            RefreshDependentServices();
+        }
+    });
+```
+
 ## Advanced Features
 
 ### Cache Dependencies
@@ -201,6 +263,11 @@ Cache.RemoveGroup("UserData");
 2. **Consider Expiration Strategies**: Choose between sliding expiration (reset on access) and absolute expiration (fixed time) based on your use case.
 3. **Set Dependencies**: Use cache dependencies to maintain consistency between related data.
 4. **Use Short Keys**: Keep your cache keys concise but descriptive.
+5. **Use Removal Callbacks Wisely**: 
+   - Use callbacks for cleanup operations (disposing resources, closing connections)
+   - Consider performance impact - callbacks are executed synchronously
+   - Avoid heavy operations in callbacks to prevent blocking cache operations
+   - Use callbacks for logging and monitoring cache behavior
 
 ## Performance Considerations
 
