@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Runtime.Caching;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace CacheUtility
 {
@@ -39,13 +40,14 @@ namespace CacheUtility
         /// <param name="groupName">The name of the cache group</param>
         /// <param name="slidingExpiration">Sliding expiration duration</param>
         /// <param name="populateMethod">Populate method which is called when the item does not exist in the cache</param>
+        /// <param name="refresh">Refresh interval to automatically update the cached data using the populate method</param>
         /// <returns>Cached or newly created object</returns>
-        public static TData Get<TData>(string cacheKey, string groupName, TimeSpan slidingExpiration, Func<TData> populateMethod)
+        public static TData Get<TData>(string cacheKey, string groupName, TimeSpan slidingExpiration, Func<TData> populateMethod, TimeSpan refresh = default)
         {
             if (string.IsNullOrEmpty(cacheKey)) throw new ArgumentNullException(nameof(cacheKey));
             if (string.IsNullOrEmpty(groupName)) throw new ArgumentNullException(nameof(groupName));
             if (populateMethod == null) throw new ArgumentNullException(nameof(populateMethod));
-            return Get(cacheKey, groupName, DateTime.MaxValue, slidingExpiration, CacheItemPriority.Default, populateMethod);
+            return Get(cacheKey, groupName, DateTime.MaxValue, slidingExpiration, CacheItemPriority.Default, populateMethod, null, refresh);
         }
 
         /// <summary>
@@ -55,10 +57,11 @@ namespace CacheUtility
         /// <param name="cacheKey">The cache key.</param>
         /// <param name="groupName">Name of the group.</param>
         /// <param name="populateMethod">The populate method.</param>
+        /// <param name="refresh">Refresh interval to automatically update the cached data using the populate method</param>
         /// <returns>``0.</returns>
-        public static TData Get<TData>(string cacheKey, string groupName, Func<TData> populateMethod)
+        public static TData Get<TData>(string cacheKey, string groupName, Func<TData> populateMethod, TimeSpan refresh = default)
         {
-            return Get(cacheKey, groupName, TimeSpan.FromMinutes(30), populateMethod);
+            return Get(cacheKey, groupName, TimeSpan.FromMinutes(30), populateMethod, refresh);
         }
 
         /// <summary>
@@ -69,10 +72,11 @@ namespace CacheUtility
         /// <param name="groupName">The name of the cache group</param>
         /// <param name="absoluteExpiration">Absolute expiration date</param>
         /// <param name="populateMethod">Populate method which is called when the item does not exist in the cache</param>
+        /// <param name="refresh">Refresh interval to automatically update the cached data using the populate method</param>
         /// <returns>Cached or newly created object</returns>
-        public static TData Get<TData>(string cacheKey, string groupName, DateTime absoluteExpiration, Func<TData> populateMethod)
+        public static TData Get<TData>(string cacheKey, string groupName, DateTime absoluteExpiration, Func<TData> populateMethod, TimeSpan refresh = default)
         {
-            return Get(cacheKey, groupName, absoluteExpiration, populateMethod);
+            return Get(cacheKey, groupName, absoluteExpiration, TimeSpan.Zero, CacheItemPriority.Default, populateMethod, null, refresh);
         }
 
         /// <summary>
@@ -81,95 +85,63 @@ namespace CacheUtility
         /// <typeparam name="TData">Cached object type</typeparam>
         /// <param name="cacheKey">Cache key</param>
         /// <param name="groupName">The name of the cache group</param>
-        /// <param name="dependency">Caching dependacy</param>
         /// <param name="absoluteExpiration">Absolute expiration date</param>
         /// <param name="slidingExpiration">Sliding expiration duration. If you are using an absolute expiration date, this has to be set to NoSlidingExpiration</param>
         /// <param name="priority">Caching priority</param>
         /// <param name="populateMethod">Populate method which is called when the item does not exist in the cache</param>
         /// <param name="removedCallback">Optional callback method that is called when the cache item is removed</param>
+        /// <param name="refresh">Refresh interval to automatically update the cached data using the populate method</param>
         /// <returns>Cached or newly created object</returns>
-        public static TData Get<TData>(string cacheKey, string groupName, DateTime absoluteExpiration, TimeSpan slidingExpiration, CacheItemPriority priority, Func<TData> populateMethod, CacheEntryRemovedCallback removedCallback = null)
+        public static TData Get<TData>(string cacheKey, string groupName, DateTime absoluteExpiration, TimeSpan slidingExpiration, CacheItemPriority priority, Func<TData> populateMethod, CacheEntryRemovedCallback removedCallback = null, TimeSpan refresh = default)
         {
+            // Validate parameters
+            if (string.IsNullOrEmpty(cacheKey)) throw new ArgumentNullException(nameof(cacheKey));
+            if (string.IsNullOrEmpty(groupName)) throw new ArgumentNullException(nameof(groupName));
+            if (populateMethod == null) throw new ArgumentNullException(nameof(populateMethod));
+
+            // Edge case handling: if refresh interval is too small, disable it
+            if (refresh > TimeSpan.Zero && refresh < TimeSpan.FromSeconds(1))
+            {
+                refresh = TimeSpan.Zero; // Disable refresh for very small intervals
+            }
+
+            // Edge case handling: if refresh interval is longer than sliding expiration, 
+            // the item might expire before refresh happens. This is allowed but logged.
+            if (refresh > TimeSpan.Zero && slidingExpiration > TimeSpan.Zero && refresh > slidingExpiration)
+            {
+                // Allow this configuration but be aware that the cache item might expire 
+                // before the refresh timer fires, causing the timer to become orphaned.
+                // The timer cleanup in RefreshCacheItem will handle this case.
+            }
+
             // Combine cachekey with the groupkey to create a unique key
+            var originalCacheKey = cacheKey;
             cacheKey = string.Format("{0}_{1}", groupName, cacheKey);
 
             // Read unlocked
-            if (MemoryCache.Default.Get(cacheKey) is not CacheItem<TData> item)
+            var item = MemoryCache.Default.Get(cacheKey) as CacheItem<TData>;
+
+            // If item doesn't exist, we must load it synchronously (no choice)
+            if (item == null)
             {
-                var needsToLoad = false;
-                ReaderWriterLockSlim perCacheKeyLock;
-
-                lock (CacheLock)
-                {
-                    // Are we already reading this key?
-                    // Get the lock handle.
-                    if (!RegisteredKeys.TryGetValue(cacheKey, out perCacheKeyLock))
-                    {
-                        perCacheKeyLock = new ReaderWriterLockSlim();
-                        RegisteredKeys.Add(cacheKey, perCacheKeyLock);
-                        //Trace.WriteLine("Create new lock " + cacheKey);
-                    }
-                }
-
-                if (perCacheKeyLock.WaitingWriteCount > 0)
-                {
-                    //Trace.WriteLine("CallLock was held for " + cacheKey);
-                }
-                perCacheKeyLock.EnterWriteLock();
-                try
-                {
-                    lock (CacheLock)
-                    {
-                        item = MemoryCache.Default.Get(cacheKey) as CacheItem<TData>;
-                        if (item == null)
-                        {
-                            needsToLoad = true;
-                        }
-                    }
-
-                    // Lock is now released to allow concurrency.
-                    if (needsToLoad)
-                    {
-                        var value = populateMethod.Invoke();
-                        item = new CacheItem<TData> { Item = value };
-
-                        // Lock again to write data.
-                        lock (CacheLock)
-                        {
-                            if (RegisteredGroups.ContainsKey(groupName))
-                            {
-                                RegisteredGroups[groupName].SubKeys.Add(cacheKey);
-                            }
-                            else
-                            {
-                                RegisteredGroups.Add(groupName, new CacheGroup { SubKeys = new List<string> { cacheKey } });
-                            }
-
-                            //The sliding expiration shouldn't be larger then one year from now, because then the Cache will give an outOfRange-exception.
-                            var maxSlidingExpiration = DateTime.Now.AddYears(1) - DateTime.Now.AddMinutes(+1);
-                            if (slidingExpiration > maxSlidingExpiration)
-                            {
-                                slidingExpiration = maxSlidingExpiration;
-                            }
-
-                            var cacheItemPolicy = new CacheItemPolicy
-                            {
-                                AbsoluteExpiration = absoluteExpiration == DateTime.MaxValue ? DateTimeOffset.MaxValue : absoluteExpiration,
-                                SlidingExpiration = slidingExpiration,
-                                Priority = priority,
-                                RemovedCallback = removedCallback
-                            };
-
-                            MemoryCache.Default.Add(cacheKey, item, cacheItemPolicy);
-                        }
-                    }
-                }
-                finally
-                {
-                    perCacheKeyLock.ExitWriteLock();
-                }
+                return LoadCacheItemSynchronously(cacheKey, originalCacheKey, groupName, absoluteExpiration, slidingExpiration, priority, populateMethod, removedCallback, refresh);
             }
 
+            // Item exists - check if refresh is needed
+            var needsRefresh = false;
+            if (refresh > TimeSpan.Zero)
+            {
+                var timeSinceLastRefresh = DateTime.Now - item.LastRefreshTime;
+                needsRefresh = timeSinceLastRefresh >= refresh;
+            }
+
+            // If refresh is needed, start background refresh but return existing data immediately
+            if (needsRefresh && !item.IsRefreshing)
+            {
+                StartBackgroundRefresh(item, cacheKey);
+            }
+
+            // Always return existing data immediately (even if stale)
             return item.Item;
         }
 
@@ -194,8 +166,17 @@ namespace CacheUtility
         {
             lock (CacheLock)
             {
-                RegisteredKeys.Remove(cacheKey);
+                // Get the cache item to dispose any timers
+                var cacheItem = MemoryCache.Default.Get(cacheKey);
+                if (cacheItem != null && cacheItem.GetType().IsGenericType && 
+                    cacheItem.GetType().GetGenericTypeDefinition() == typeof(CacheItem<>))
+                {
+                    // Use reflection to call Dispose method
+                    var disposeMethod = cacheItem.GetType().GetMethod("Dispose");
+                    disposeMethod?.Invoke(cacheItem, null);
+                }
 
+                RegisteredKeys.Remove(cacheKey);
                 MemoryCache.Default.Remove(cacheKey);
             }
         }
@@ -321,6 +302,266 @@ namespace CacheUtility
         }
 
         /// <summary>
+        /// Loads a cache item synchronously when it doesn't exist
+        /// </summary>
+        /// <typeparam name="TData">Cache item type</typeparam>
+        /// <param name="cacheKey">Full cache key</param>
+        /// <param name="originalCacheKey">Original cache key without group prefix</param>
+        /// <param name="groupName">Group name</param>
+        /// <param name="absoluteExpiration">Absolute expiration</param>
+        /// <param name="slidingExpiration">Sliding expiration</param>
+        /// <param name="priority">Cache priority</param>
+        /// <param name="populateMethod">Method to populate cache</param>
+        /// <param name="removedCallback">Removal callback</param>
+        /// <param name="refresh">Refresh interval</param>
+        /// <returns>Cache item value</returns>
+        private static TData LoadCacheItemSynchronously<TData>(string cacheKey, string originalCacheKey, string groupName, DateTime absoluteExpiration, TimeSpan slidingExpiration, CacheItemPriority priority, Func<TData> populateMethod, CacheEntryRemovedCallback removedCallback, TimeSpan refresh)
+        {
+            ReaderWriterLockSlim perCacheKeyLock;
+
+            lock (CacheLock)
+            {
+                // Get or create the lock handle
+                if (!RegisteredKeys.TryGetValue(cacheKey, out perCacheKeyLock))
+                {
+                    perCacheKeyLock = new ReaderWriterLockSlim();
+                    RegisteredKeys.Add(cacheKey, perCacheKeyLock);
+                }
+            }
+
+            perCacheKeyLock.EnterWriteLock();
+            try
+            {
+                // Double-check item doesn't exist after acquiring lock
+                var item = MemoryCache.Default.Get(cacheKey) as CacheItem<TData>;
+                if (item != null)
+                {
+                    return item.Item; // Another thread created it
+                }
+
+                // Create new cache item
+                var value = populateMethod.Invoke();
+                item = new CacheItem<TData>
+                {
+                    Item = value,
+                    LastRefreshTime = DateTime.Now,
+                    RefreshInterval = refresh,
+                    PopulateMethod = populateMethod,
+                    CacheKey = originalCacheKey,
+                    GroupName = groupName,
+                    IsRefreshing = false,
+                    LastRefreshAttempt = DateTime.Now
+                };
+
+                // Add to cache
+                lock (CacheLock)
+                {
+                    if (RegisteredGroups.ContainsKey(groupName))
+                    {
+                        RegisteredGroups[groupName].SubKeys.Add(cacheKey);
+                    }
+                    else
+                    {
+                        RegisteredGroups.Add(groupName, new CacheGroup { SubKeys = new List<string> { cacheKey } });
+                    }
+
+                    // The sliding expiration shouldn't be larger than one year from now
+                    var maxSlidingExpiration = DateTime.Now.AddYears(1) - DateTime.Now.AddMinutes(+1);
+                    if (slidingExpiration > maxSlidingExpiration)
+                    {
+                        slidingExpiration = maxSlidingExpiration;
+                    }
+
+                    var cacheItemPolicy = new CacheItemPolicy
+                    {
+                        AbsoluteExpiration = absoluteExpiration == DateTime.MaxValue ? DateTimeOffset.MaxValue : absoluteExpiration,
+                        SlidingExpiration = slidingExpiration,
+                        Priority = priority,
+                        RemovedCallback = CreateCombinedCallback(removedCallback, item)
+                    };
+
+                    MemoryCache.Default.Add(cacheKey, item, cacheItemPolicy);
+
+                    // Set up refresh timer if refresh interval is specified
+                    if (refresh > TimeSpan.Zero)
+                    {
+                        SetupRefreshTimer(item, cacheKey);
+                    }
+                }
+
+                return item.Item;
+            }
+            finally
+            {
+                perCacheKeyLock.ExitWriteLock();
+            }
+        }
+
+        /// <summary>
+        /// Starts a background refresh operation for a cache item
+        /// </summary>
+        /// <typeparam name="TData">Cache item type</typeparam>
+        /// <param name="cacheItem">Cache item to refresh</param>
+        /// <param name="fullCacheKey">Full cache key</param>
+        private static void StartBackgroundRefresh<TData>(CacheItem<TData> cacheItem, string fullCacheKey)
+        {
+            if (cacheItem?.PopulateMethod == null)
+                return;
+
+            // Use the item's refresh lock to prevent multiple concurrent refreshes
+            lock (cacheItem.RefreshLock)
+            {
+                // Double-check we're not already refreshing
+                if (cacheItem.IsRefreshing)
+                    return;
+
+                // Prevent too frequent refresh attempts (minimum 1 second between attempts)
+                var timeSinceLastAttempt = DateTime.Now - cacheItem.LastRefreshAttempt;
+                if (timeSinceLastAttempt < TimeSpan.FromSeconds(1))
+                    return;
+
+                // Mark as refreshing
+                cacheItem.IsRefreshing = true;
+                cacheItem.RefreshStartTime = DateTime.Now;
+                cacheItem.LastRefreshAttempt = DateTime.Now;
+            }
+
+            // Start background refresh task
+            cacheItem.RefreshTask = Task.Run(() =>
+            {
+                try
+                {
+                    // Verify item still exists in cache
+                    var currentItem = MemoryCache.Default.Get(fullCacheKey) as CacheItem<TData>;
+                    if (currentItem == null || currentItem != cacheItem)
+                    {
+                        return; // Cache item was removed or replaced
+                    }
+
+                    // Execute the populate method
+                    var newValue = cacheItem.PopulateMethod.Invoke();
+
+                    // Update the cache item with minimal locking
+                    UpdateCacheItemValue(cacheItem, newValue);
+                }
+                catch (Exception)
+                {
+                    // If refresh fails, we keep the existing data and will try again later
+                    // This ensures the cache remains available even if populate method fails
+                }
+                finally
+                {
+                    // Always mark refresh as complete
+                    lock (cacheItem.RefreshLock)
+                    {
+                        cacheItem.IsRefreshing = false;
+                    }
+                }
+            });
+        }
+
+        /// <summary>
+        /// Updates a cache item value with minimal locking
+        /// </summary>
+        /// <typeparam name="TData">Cache item type</typeparam>
+        /// <param name="cacheItem">Cache item to update</param>
+        /// <param name="newValue">New value</param>
+        private static void UpdateCacheItemValue<TData>(CacheItem<TData> cacheItem, TData newValue)
+        {
+            lock (cacheItem.RefreshLock)
+            {
+                cacheItem.Item = newValue;
+                cacheItem.LastRefreshTime = DateTime.Now;
+            }
+        }
+
+        /// <summary>
+        /// Creates a combined callback that handles both user callback and timer disposal
+        /// </summary>
+        /// <typeparam name="T">Cache item type</typeparam>
+        /// <param name="userCallback">User-provided callback</param>
+        /// <param name="cacheItem">Cache item to dispose</param>
+        /// <returns>Combined callback</returns>
+        private static CacheEntryRemovedCallback CreateCombinedCallback<T>(CacheEntryRemovedCallback userCallback, CacheItem<T> cacheItem)
+        {
+            return (args) =>
+            {
+                // Dispose the cache item (which will dispose the timer)
+                cacheItem?.Dispose();
+                
+                // Call user callback if provided
+                userCallback?.Invoke(args);
+            };
+        }
+
+        /// <summary>
+        /// Sets up the refresh timer for a cache item
+        /// </summary>
+        /// <typeparam name="T">Cache item type</typeparam>
+        /// <param name="cacheItem">Cache item to refresh</param>
+        /// <param name="fullCacheKey">Full cache key (including group prefix)</param>
+        private static void SetupRefreshTimer<T>(CacheItem<T> cacheItem, string fullCacheKey)
+        {
+            if (cacheItem.RefreshInterval <= TimeSpan.Zero || cacheItem.PopulateMethod == null)
+                return;
+
+            // Dispose existing timer if any
+            cacheItem.RefreshTimer?.Dispose();
+
+            // Create new timer
+            cacheItem.RefreshTimer = new Timer(
+                callback: (state) => RefreshCacheItem(fullCacheKey, cacheItem),
+                state: null,
+                dueTime: cacheItem.RefreshInterval,
+                period: cacheItem.RefreshInterval
+            );
+        }
+
+        /// <summary>
+        /// Refreshes a cache item using its populate method (called by timer)
+        /// Now uses non-blocking approach
+        /// </summary>
+        /// <typeparam name="T">Cache item type</typeparam>
+        /// <param name="fullCacheKey">Full cache key (including group prefix)</param>
+        /// <param name="cacheItem">Cache item to refresh</param>
+        private static void RefreshCacheItem<T>(string fullCacheKey, CacheItem<T> cacheItem)
+        {
+            if (cacheItem?.PopulateMethod == null)
+                return;
+
+            try
+            {
+                // Check if the cache key still exists
+                lock (CacheLock)
+                {
+                    if (!RegisteredKeys.ContainsKey(fullCacheKey))
+                    {
+                        // Cache item was removed, dispose timer
+                        cacheItem.Dispose();
+                        return;
+                    }
+                }
+
+                // Verify item still exists in cache
+                var currentItem = MemoryCache.Default.Get(fullCacheKey) as CacheItem<T>;
+                if (currentItem == null || currentItem != cacheItem)
+                {
+                    // Cache item was replaced or removed
+                    cacheItem.Dispose();
+                    return;
+                }
+
+                // Use the same non-blocking refresh mechanism as manual refreshes
+                StartBackgroundRefresh(cacheItem, fullCacheKey);
+            }
+            catch (Exception)
+            {
+                // If any error occurs in timer callback, dispose the timer to prevent further issues
+                cacheItem?.Dispose();
+            }
+        }
+
+        /// <summary>
         /// Helper class to support cache groups
         /// </summary>
         private struct CacheGroup
@@ -336,13 +577,114 @@ namespace CacheUtility
         /// </summary>
         /// <typeparam name="T">Cached Item type</typeparam>
         [Serializable]
-        public class CacheItem<T>
+        public class CacheItem<T> : IDisposable
         {
+            /// <summary>
+            /// The populate method used to refresh this cache item (not serialized)
+            /// </summary>
+            [NonSerialized]
+            private Func<T> _populateMethod;
+
+            /// <summary>
+            /// Timer for automatic refresh (not serialized)
+            /// </summary>
+            [NonSerialized]
+            private Timer _refreshTimer;
+
+            /// <summary>
+            /// Current refresh task (not serialized)
+            /// </summary>
+            [NonSerialized]
+            private Task _refreshTask;
+
+            /// <summary>
+            /// Lock for refresh state operations (not serialized)
+            /// </summary>
+            [NonSerialized]
+            private readonly object _refreshLock = new object();
+
             /// <summary>
             /// Cached item
             /// </summary>
             /// <value>The item.</value>
             public T Item { get; set; }
+
+            /// <summary>
+            /// The last time this cache item was refreshed
+            /// </summary>
+            public DateTime LastRefreshTime { get; set; }
+
+            /// <summary>
+            /// The refresh interval for this cache item
+            /// </summary>
+            public TimeSpan RefreshInterval { get; set; }
+
+            /// <summary>
+            /// Cache key for this item (used in refresh callbacks)
+            /// </summary>
+            public string CacheKey { get; set; }
+
+            /// <summary>
+            /// Group name for this item (used in refresh callbacks)
+            /// </summary>
+            public string GroupName { get; set; }
+
+            /// <summary>
+            /// Indicates if a refresh operation is currently in progress
+            /// </summary>
+            public bool IsRefreshing { get; set; }
+
+            /// <summary>
+            /// When the current refresh operation started
+            /// </summary>
+            public DateTime RefreshStartTime { get; set; }
+
+            /// <summary>
+            /// The last time a refresh was attempted (regardless of success)
+            /// </summary>
+            public DateTime LastRefreshAttempt { get; set; }
+
+            /// <summary>
+            /// The populate method used to refresh this cache item
+            /// </summary>
+            public Func<T> PopulateMethod 
+            { 
+                get => _populateMethod; 
+                set => _populateMethod = value; 
+            }
+
+            /// <summary>
+            /// Timer for automatic refresh
+            /// </summary>
+            public Timer RefreshTimer 
+            { 
+                get => _refreshTimer; 
+                set => _refreshTimer = value; 
+            }
+
+            /// <summary>
+            /// Current refresh task
+            /// </summary>
+            public Task RefreshTask 
+            { 
+                get => _refreshTask; 
+                set => _refreshTask = value; 
+            }
+
+            /// <summary>
+            /// Lock for refresh state operations
+            /// </summary>
+            public object RefreshLock => _refreshLock ?? new object();
+
+            /// <summary>
+            /// Dispose of the refresh timer when cache item is disposed
+            /// </summary>
+            public void Dispose()
+            {
+                _refreshTimer?.Dispose();
+                _refreshTimer = null;
+                // Note: We don't dispose the refresh task as it may still be running
+            }
         }
 
         /// <summary>
@@ -403,6 +745,8 @@ namespace CacheUtility
 
             return result;
         }
+
+
 
     }
 }

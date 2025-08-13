@@ -3,7 +3,7 @@
   <PropertyGroup>
     <TargetFramework>net9.0</TargetFramework>
     <GeneratePackageOnBuild>True</GeneratePackageOnBuild>
-    <Version>1.0.10</Version>
+    <Version>1.0.20</Version>
     <Title>Thread-Safe .NET Memory Cache with Groups, Dependencies &amp; Auto-Population</Title>
     <Authors>Onno Pistorius</Authors>
     <Company>Athena ICT</Company>
@@ -22,7 +22,7 @@ Perfect for high-performance applications requiring sophisticated caching patter
     <PackageProjectUrl>https://www.athenaict.com/NuGet/Cache</PackageProjectUrl>
     <PackageIcon>Logo_initials.png</PackageIcon>
     <PackageTags>cache;caching;memory-cache;thread-safe;cache-groups;cache-dependencies;auto-population;performance;dotnet;system-runtime-caching;cache-management;high-performance;scalability;cache-utility;bulk-retrieval;</PackageTags>
-    <PackageReleaseNotes>Added GetAllByGroup method to retrieve all cached items from a specific group. Changed class name from CacheUtility to Cache to resolve namespace/class naming conflict and follow C# best practices. Updated the README.md file with the updated class name 'Cache' (instead of 'CacheUtility'). Supports optional removal callbacks: useful for triggering dependent actions.</PackageReleaseNotes>
+    <PackageReleaseNotes>Added non-blocking automatic cache refresh functionality that keeps cached data fresh by refreshing it in the background at specified intervals, ensuring high availability and responsiveness even during slow data population operations.</PackageReleaseNotes>
     <PackageId>CacheUtility</PackageId>
     <Product>CacheUtility</Product>
     <PackageLicenseFile>License.txt</PackageLicenseFile>
