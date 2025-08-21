@@ -440,5 +440,112 @@ namespace CacheUtility.Tests
             Assert.Equal("Data_1", result);
             Assert.Equal("Data_1", result2); // Should be same initially, refresh happens in background
         }
+
+        [Fact]
+        public void GetAllCacheMetadata_WithMultipleItems_ReturnsAllMetadata()
+        {
+            // Arrange
+            const string group1 = "MetadataTestGroup1";
+            const string group2 = "MetadataTestGroup2";
+            var testList = new List<string> { "A", "B", "C" };
+
+            Cache.Get("stringKey", group1, () => "Hello World");
+            Cache.Get("intKey", group1, () => 42);
+            Cache.Get("listKey", group2, () => testList);
+
+            // Act
+            var metadata = Cache.GetAllCacheMetadata().ToList();
+
+            // Assert
+            Assert.Equal(3, metadata.Count);
+            
+            var stringMetadata = metadata.FirstOrDefault(m => m.CacheKey == "stringKey");
+            Assert.NotNull(stringMetadata);
+            Assert.Equal(group1, stringMetadata.GroupName);
+            Assert.Equal("String", stringMetadata.DataType);
+            Assert.True(stringMetadata.EstimatedMemorySize > 0);
+            Assert.Null(stringMetadata.CollectionCount); // String is not a collection
+
+            var intMetadata = metadata.FirstOrDefault(m => m.CacheKey == "intKey");
+            Assert.NotNull(intMetadata);
+            Assert.Equal(group1, intMetadata.GroupName);
+            Assert.Equal("Int32", intMetadata.DataType);
+
+            var listMetadata = metadata.FirstOrDefault(m => m.CacheKey == "listKey");
+            Assert.NotNull(listMetadata);
+            Assert.Equal(group2, listMetadata.GroupName);
+            Assert.Equal(3, listMetadata.CollectionCount); // List with 3 items
+        }
+
+        [Fact]
+        public void GetAllCacheMetadata_WithRefreshingItem_ShowsRefreshStatus()
+        {
+            // Arrange
+            const string groupName = "RefreshStatusGroup";
+            const string cacheKey = "refreshStatusKey";
+
+            // Create item with refresh interval
+            Cache.Get(cacheKey, groupName, TimeSpan.FromMinutes(10), () => "Initial Data", TimeSpan.FromSeconds(1));
+
+            // Act
+            var metadata = Cache.GetAllCacheMetadata().ToList();
+
+            // Assert
+            var itemMetadata = metadata.FirstOrDefault(m => m.CacheKey == cacheKey);
+            Assert.NotNull(itemMetadata);
+            Assert.True(itemMetadata.RefreshInterval.TotalMilliseconds >= 1000); // At least 1 second
+            Assert.True(itemMetadata.LastRefreshTime > DateTime.MinValue);
+            Assert.Equal(groupName, itemMetadata.GroupName);
+            Assert.Equal(cacheKey, itemMetadata.CacheKey);
+            Assert.Equal("String", itemMetadata.DataType);
+        }
+
+        [Fact]
+        public void GetAllCacheMetadata_WithNamedMethod_ReturnsPopulateMethodName()
+        {
+            // Arrange
+            const string groupName = "MethodNameTestGroup";
+            const string cacheKey = "methodNameKey";
+
+            // Use a direct method reference (not lambda)
+            Cache.Get(cacheKey, groupName, GetTestData);
+
+            // Act
+            var metadata = Cache.GetAllCacheMetadata().ToList();
+
+            // Assert
+            var itemMetadata = metadata.FirstOrDefault(m => m.CacheKey == cacheKey);
+            Assert.NotNull(itemMetadata);
+            Assert.NotNull(itemMetadata.PopulateMethodName);
+            Assert.Contains("GetTestData", itemMetadata.PopulateMethodName);
+        }
+
+        [Fact]
+        public void GetAllCacheMetadata_WithLambda_ShowsLambdaIndicator()
+        {
+            // Arrange
+            const string groupName = "LambdaTestGroup";
+            const string cacheKey = "lambdaKey";
+
+            // Use a lambda expression
+            Cache.Get(cacheKey, groupName, () => "Lambda Result");
+
+            // Act
+            var metadata = Cache.GetAllCacheMetadata().ToList();
+
+            // Assert
+            var itemMetadata = metadata.FirstOrDefault(m => m.CacheKey == cacheKey);
+            Assert.NotNull(itemMetadata);
+            Assert.Equal("[Lambda/Anonymous]", itemMetadata.PopulateMethodName);
+        }
+
+        /// <summary>
+        /// Test method used by the populate method name test
+        /// </summary>
+        /// <returns>Test data</returns>
+        private static string GetTestData()
+        {
+            return "Test data from named method";
+        }
     }
 } 

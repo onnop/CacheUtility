@@ -125,6 +125,83 @@ if (allItems.ContainsKey("MySpecificKey"))
 }
 ```
 
+### Cache metadata and monitoring
+
+Get detailed metadata about cached items for monitoring, debugging, or displaying in management interfaces:
+
+```csharp
+// Get metadata for all cached items
+var allMetadata = Cache.GetAllCacheMetadata();
+
+foreach (var metadata in allMetadata)
+{
+    Console.WriteLine($"Key: {metadata.CacheKey}");
+    Console.WriteLine($"  Group: {metadata.GroupName}");
+    Console.WriteLine($"  Type: {metadata.DataType}");
+    Console.WriteLine($"  Size: {metadata.EstimatedMemorySize:N0} bytes");
+    Console.WriteLine($"  Last Refresh: {metadata.LastRefreshTime:yyyy-MM-dd HH:mm:ss}");
+    Console.WriteLine($"  Refresh Interval: {metadata.RefreshInterval}");
+    Console.WriteLine($"  Is Refreshing: {metadata.IsRefreshing}");
+    Console.WriteLine($"  Populate Method: {metadata.PopulateMethodName ?? "Unknown"}");
+    
+    if (metadata.CollectionCount.HasValue)
+    {
+        Console.WriteLine($"  Items in Collection: {metadata.CollectionCount}");
+    }
+}
+
+// You can filter the results as needed
+var userDataItems = allMetadata.Where(m => m.GroupName == "UserProfiles");
+```
+
+#### Available metadata properties
+
+Each `CacheItemMetadata` object contains:
+
+- **CacheKey**: Original cache key (without group prefix)
+- **GroupName**: Cache group name
+- **DataType**: Type name of the cached object
+- **EstimatedMemorySize**: Estimated memory usage in bytes (using JSON serialization)
+- **LastRefreshTime**: When the data was last refreshed
+- **LastRefreshAttempt**: When the last refresh was attempted (regardless of success)
+- **RefreshInterval**: Auto-refresh interval
+- **IsRefreshing**: Whether a refresh operation is currently in progress
+- **RefreshStartTime**: When the current refresh operation started
+- **CollectionCount**: Number of items if the cached object is a collection
+- **PopulateMethodName**: Name of the method used to populate/refresh the cache item
+- **RemovalCallbackName**: Name of the removal callback method (currently not available due to MemoryCache limitations)
+
+#### Populate method names
+
+The `PopulateMethodName` property helps identify which methods are used to populate cache items:
+
+```csharp
+// Direct method reference - shows actual method name
+Cache.Get("key1", "group", MyDataService.LoadUserData);
+// PopulateMethodName: "MyDataService.LoadUserData"
+
+// Lambda expression - shows indicator
+Cache.Get("key2", "group", () => database.GetUser(123));
+// PopulateMethodName: "[Lambda/Anonymous]"
+
+// Anonymous method - shows indicator  
+Cache.Get("key3", "group", delegate() { return "test"; });
+// PopulateMethodName: "[Lambda/Anonymous]"
+```
+
+This is particularly useful for:
+- **Debugging**: Identifying which populate methods are being called
+- **Performance monitoring**: Tracking which data sources are being used
+- **Code analysis**: Understanding cache usage patterns across your application
+
+#### Use cases for metadata
+
+- **Monitoring dashboards**: Display cache usage, memory consumption, and refresh status
+- **Debug interfaces**: Inspect cache contents and timing information
+- **Performance analysis**: Identify large cached objects or frequently refreshed items
+- **Administrative tools**: Manage cache contents through custom interfaces
+- **Reporting**: Generate cache usage reports and statistics
+
 ### Global cache operations
 
 Clear the entire cache:

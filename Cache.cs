@@ -1,7 +1,10 @@
 ﻿using System;
+using System.Collections;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Runtime.Caching;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -746,8 +749,283 @@ namespace CacheUtility
             return result;
         }
 
+        /// <summary>
+        /// Get metadata for all cached items
+        /// </summary>
+        /// <returns>Enumerable collection of cache item metadata</returns>
+        public static IEnumerable<CacheItemMetadata> GetAllCacheMetadata()
+        {
+            var metadataList = new List<CacheItemMetadata>();
 
+            lock (CacheLock)
+            {
+                foreach (var group in RegisteredGroups)
+                {
+                    var groupName = group.Key;
+                    foreach (var fullCacheKey in group.Value.SubKeys)
+                    {
+                        var cachedItem = MemoryCache.Default.Get(fullCacheKey);
+                        if (cachedItem != null)
+                        {
+                            var metadata = CreateMetadataFromCacheItem(fullCacheKey, groupName, cachedItem);
+                            if (metadata != null)
+                            {
+                                metadataList.Add(metadata);
+                            }
+                        }
+                    }
+                }
+            }
 
+            return metadataList;
+        }
+
+        /// <summary>
+        /// Creates metadata object from a cache item
+        /// </summary>
+        /// <param name="fullCacheKey">Full cache key including group prefix</param>
+        /// <param name="groupName">Group name</param>
+        /// <param name="cachedItem">The cached item object</param>
+        /// <returns>CacheItemMetadata object or null if item cannot be processed</returns>
+        private static CacheItemMetadata CreateMetadataFromCacheItem(string fullCacheKey, string groupName, object cachedItem)
+        {
+            try
+            {
+                // Extract original cache key by removing group prefix
+                var originalKey = fullCacheKey.Substring(groupName.Length + 1); // +1 for underscore
+
+                // Check if this is a CacheItem<T> wrapper
+                if (cachedItem.GetType().IsGenericType &&
+                    cachedItem.GetType().GetGenericTypeDefinition() == typeof(CacheItem<>))
+                {
+                    // Extract properties from CacheItem<T>
+                    var itemProperty = cachedItem.GetType().GetProperty("Item");
+                    var lastRefreshTimeProperty = cachedItem.GetType().GetProperty("LastRefreshTime");
+                    var refreshIntervalProperty = cachedItem.GetType().GetProperty("RefreshInterval");
+                    var isRefreshingProperty = cachedItem.GetType().GetProperty("IsRefreshing");
+                    var refreshStartTimeProperty = cachedItem.GetType().GetProperty("RefreshStartTime");
+                    var lastRefreshAttemptProperty = cachedItem.GetType().GetProperty("LastRefreshAttempt");
+                    var populateMethodProperty = cachedItem.GetType().GetProperty("PopulateMethod");
+
+                    var actualItem = itemProperty?.GetValue(cachedItem);
+                    if (actualItem == null) return null;
+
+                    // Get populate method name
+                    var populateMethod = populateMethodProperty?.GetValue(cachedItem) as Delegate;
+                    var populateMethodName = GetMethodName(populateMethod);
+
+                    var metadata = new CacheItemMetadata
+                    {
+                        CacheKey = originalKey,
+                        GroupName = groupName,
+                        DataType = actualItem.GetType().Name,
+                        EstimatedMemorySize = EstimateObjectSize(actualItem),
+                        LastRefreshTime = (DateTime)(lastRefreshTimeProperty?.GetValue(cachedItem) ?? DateTime.MinValue),
+                        RefreshInterval = (TimeSpan)(refreshIntervalProperty?.GetValue(cachedItem) ?? TimeSpan.Zero),
+                        IsRefreshing = (bool)(isRefreshingProperty?.GetValue(cachedItem) ?? false),
+                        RefreshStartTime = (DateTime?)(refreshStartTimeProperty?.GetValue(cachedItem)),
+                        LastRefreshAttempt = (DateTime?)(lastRefreshAttemptProperty?.GetValue(cachedItem)),
+                        CollectionCount = GetCollectionCount(actualItem),
+                        PopulateMethodName = populateMethodName,
+                        RemovalCallbackName = null // Cannot be determined from MemoryCache policy
+                    };
+
+                    return metadata;
+                }
+                else
+                {
+                    // Direct cached object (not wrapped in CacheItem<T>)
+                    return new CacheItemMetadata
+                    {
+                        CacheKey = originalKey,
+                        GroupName = groupName,
+                        DataType = cachedItem.GetType().Name,
+                        EstimatedMemorySize = EstimateObjectSize(cachedItem),
+                        LastRefreshTime = DateTime.MinValue, // Unknown for direct cached items
+                        RefreshInterval = TimeSpan.Zero,
+                        IsRefreshing = false,
+                        CollectionCount = GetCollectionCount(cachedItem),
+                        PopulateMethodName = null, // Unknown for direct cached items
+                        RemovalCallbackName = null // Cannot be determined from MemoryCache
+                    };
+                }
+            }
+            catch (Exception)
+            {
+                // If we can't process the item, return null
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Estimates the memory size of an object using JSON serialization
+        /// </summary>
+        /// <param name="obj">Object to estimate size for</param>
+        /// <returns>Estimated size in bytes</returns>
+        private static long EstimateObjectSize(object obj)
+        {
+            if (obj == null) return 0;
+
+            try
+            {
+                // Use JSON serialization as a rough estimate of object size
+                var json = JsonSerializer.Serialize(obj);
+                return System.Text.Encoding.UTF8.GetByteCount(json);
+            }
+            catch
+            {
+                // Fallback: basic size estimation for common types
+                return obj switch
+                {
+                    string str => str.Length * 2, // Unicode characters are 2 bytes
+                    int => 4,
+                    long => 8,
+                    double => 8,
+                    float => 4,
+                    bool => 1,
+                    DateTime => 8,
+                    _ => 64 // Default estimate for unknown types
+                };
+            }
+        }
+
+        /// <summary>
+        /// Gets the count of items in a collection, if applicable
+        /// </summary>
+        /// <param name="obj">Object to check</param>
+        /// <returns>Count if object is a collection, null otherwise</returns>
+        private static int? GetCollectionCount(object obj)
+        {
+            if (obj == null) return null;
+
+            // Check if object implements ICollection (most collections do)
+            if (obj is ICollection collection)
+            {
+                return collection.Count;
+            }
+
+            // Check for IEnumerable as fallback (but this requires enumeration)
+            if (obj is IEnumerable enumerable && !(obj is string)) // string is IEnumerable but we don't want to count characters
+            {
+                try
+                {
+                    return enumerable.Cast<object>().Count();
+                }
+                catch
+                {
+                    // If enumeration fails, return null
+                    return null;
+                }
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Extracts the method name from a delegate
+        /// </summary>
+        /// <param name="method">The delegate to extract name from</param>
+        /// <returns>Method name or null if not available</returns>
+        private static string GetMethodName(Delegate method)
+        {
+            if (method == null) return null;
+
+            try
+            {
+                // Check if it's a simple method (not lambda or anonymous)
+                if (method.Method != null)
+                {
+                    var methodInfo = method.Method;
+                    
+                    // Skip compiler-generated methods (lambdas, anonymous methods)
+                    if (methodInfo.Name.Contains("<") || methodInfo.Name.Contains("lambda") || 
+                        methodInfo.Name.Contains("Anonymous") || methodInfo.DeclaringType?.Name.Contains("<>") == true)
+                    {
+                        return "[Lambda/Anonymous]";
+                    }
+
+                    // For regular methods, return ClassName.MethodName
+                    if (methodInfo.DeclaringType != null)
+                    {
+                        return $"{methodInfo.DeclaringType.Name}.{methodInfo.Name}";
+                    }
+
+                    return methodInfo.Name;
+                }
+            }
+            catch
+            {
+                // If we can't determine the method name, return null
+            }
+
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Metadata information about a cached item
+    /// </summary>
+    public class CacheItemMetadata
+    {
+        /// <summary>
+        /// Original cache key (without group prefix)
+        /// </summary>
+        public string CacheKey { get; set; }
+
+        /// <summary>
+        /// Cache group name
+        /// </summary>
+        public string GroupName { get; set; }
+
+        /// <summary>
+        /// Type name of the cached object
+        /// </summary>
+        public string DataType { get; set; }
+
+        /// <summary>
+        /// Estimated memory usage in bytes
+        /// </summary>
+        public long EstimatedMemorySize { get; set; }
+
+        /// <summary>
+        /// When the data was last refreshed
+        /// </summary>
+        public DateTime LastRefreshTime { get; set; }
+
+        /// <summary>
+        /// When the last refresh was attempted (regardless of success)
+        /// </summary>
+        public DateTime? LastRefreshAttempt { get; set; }
+
+        /// <summary>
+        /// Auto-refresh interval
+        /// </summary>
+        public TimeSpan RefreshInterval { get; set; }
+
+        /// <summary>
+        /// Whether a refresh operation is currently in progress
+        /// </summary>
+        public bool IsRefreshing { get; set; }
+
+        /// <summary>
+        /// When the current refresh operation started
+        /// </summary>
+        public DateTime? RefreshStartTime { get; set; }
+
+        /// <summary>
+        /// Count of items if the cached object is a collection
+        /// </summary>
+        public int? CollectionCount { get; set; }
+
+        /// <summary>
+        /// Name of the populate method used to create/refresh this cache item
+        /// </summary>
+        public string PopulateMethodName { get; set; }
+
+        /// <summary>
+        /// Name of the removal callback method if one is set
+        /// </summary>
+        public string RemovalCallbackName { get; set; }
     }
 }
 
