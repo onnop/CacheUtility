@@ -448,7 +448,10 @@ namespace CacheUtility
                     TotalFiles = 0,
                     TotalSizeBytes = 0,
                     CacheFiles = 0,
-                    MetaFiles = 0
+                    MetaFiles = 0,
+                    LargestFileSize = 0,
+                    SmallestFileSize = 0,
+                    OrphanedFiles = 0
                 };
             }
 
@@ -463,19 +466,39 @@ namespace CacheUtility
                         TotalFiles = 0,
                         TotalSizeBytes = 0,
                         CacheFiles = 0,
-                        MetaFiles = 0
+                        MetaFiles = 0,
+                        LargestFileSize = 0,
+                        SmallestFileSize = 0,
+                        OrphanedFiles = 0
                     };
                 }
 
                 var cacheFiles = Directory.GetFiles(_persistentOptions.BaseDirectory, "*.cache");
                 var metaFiles = Directory.GetFiles(_persistentOptions.BaseDirectory, "*.meta");
+                var allFiles = cacheFiles.Concat(metaFiles).ToArray();
                 
                 long totalSize = 0;
-                foreach (var file in cacheFiles.Concat(metaFiles))
+                long largestSize = 0;
+                long smallestSize = long.MaxValue;
+                DateTime? oldestTime = null;
+                DateTime? newestTime = null;
+                
+                foreach (var file in allFiles)
                 {
                     try
                     {
-                        totalSize += new FileInfo(file).Length;
+                        var fileInfo = new FileInfo(file);
+                        var size = fileInfo.Length;
+                        var lastWrite = fileInfo.LastWriteTime;
+                        
+                        totalSize += size;
+                        largestSize = Math.Max(largestSize, size);
+                        smallestSize = Math.Min(smallestSize, size);
+                        
+                        if (!oldestTime.HasValue || lastWrite < oldestTime.Value)
+                            oldestTime = lastWrite;
+                        if (!newestTime.HasValue || lastWrite > newestTime.Value)
+                            newestTime = lastWrite;
                     }
                     catch
                     {
@@ -483,14 +506,24 @@ namespace CacheUtility
                     }
                 }
 
+                // Calculate orphaned files (cache files without corresponding meta files, or vice versa)
+                var cacheFileNames = cacheFiles.Select(f => Path.GetFileNameWithoutExtension(f)).ToHashSet();
+                var metaFileNames = metaFiles.Select(f => Path.GetFileNameWithoutExtension(f)).ToHashSet();
+                var orphanedCount = cacheFileNames.Except(metaFileNames).Count() + metaFileNames.Except(cacheFileNames).Count();
+
                 return new PersistentCacheStatistics
                 {
                     IsEnabled = true,
                     BaseDirectory = _persistentOptions.BaseDirectory,
-                    TotalFiles = cacheFiles.Length + metaFiles.Length,
+                    TotalFiles = allFiles.Length,
                     TotalSizeBytes = totalSize,
                     CacheFiles = cacheFiles.Length,
-                    MetaFiles = metaFiles.Length
+                    MetaFiles = metaFiles.Length,
+                    OldestFileTime = oldestTime,
+                    NewestFileTime = newestTime,
+                    LargestFileSize = allFiles.Length > 0 ? largestSize : 0,
+                    SmallestFileSize = allFiles.Length > 0 ? smallestSize : 0,
+                    OrphanedFiles = orphanedCount
                 };
             }
             catch
@@ -502,7 +535,10 @@ namespace CacheUtility
                     TotalFiles = 0,
                     TotalSizeBytes = 0,
                     CacheFiles = 0,
-                    MetaFiles = 0
+                    MetaFiles = 0,
+                    LargestFileSize = 0,
+                    SmallestFileSize = 0,
+                    OrphanedFiles = 0
                 };
             }
         }
@@ -1326,20 +1362,24 @@ namespace CacheUtility
                     var populateMethod = populateMethodProperty?.GetValue(cachedItem) as Delegate;
                     var populateMethodName = GetMethodName(populateMethod);
 
+                    var lastRefreshTime = (DateTime)(lastRefreshTimeProperty?.GetValue(cachedItem) ?? DateTime.MinValue);
+                    var refreshInterval = (TimeSpan)(refreshIntervalProperty?.GetValue(cachedItem) ?? TimeSpan.Zero);
+                    
                     var metadata = new CacheItemMetadata
                     {
                         CacheKey = originalKey,
                         GroupName = groupName,
                         DataType = actualItem.GetType().Name,
                         EstimatedMemorySize = EstimateObjectSize(actualItem),
-                        LastRefreshTime = (DateTime)(lastRefreshTimeProperty?.GetValue(cachedItem) ?? DateTime.MinValue),
-                        RefreshInterval = (TimeSpan)(refreshIntervalProperty?.GetValue(cachedItem) ?? TimeSpan.Zero),
+                        LastRefreshTime = lastRefreshTime,
+                        RefreshInterval = refreshInterval,
                         IsRefreshing = (bool)(isRefreshingProperty?.GetValue(cachedItem) ?? false),
                         RefreshStartTime = (DateTime?)(refreshStartTimeProperty?.GetValue(cachedItem)),
                         LastRefreshAttempt = (DateTime?)(lastRefreshAttemptProperty?.GetValue(cachedItem)),
                         CollectionCount = GetCollectionCount(actualItem),
                         PopulateMethodName = populateMethodName,
-                        RemovalCallbackName = null // Cannot be determined from MemoryCache policy
+                        NextRefreshTime = CalculateNextRefreshTime(lastRefreshTime, refreshInterval),
+                        PersistentCacheEnabled = _persistentOptions != null
                     };
 
                     // Add persistent cache information
@@ -1361,7 +1401,8 @@ namespace CacheUtility
                         IsRefreshing = false,
                         CollectionCount = GetCollectionCount(cachedItem),
                         PopulateMethodName = null, // Unknown for direct cached items
-                        RemovalCallbackName = null // Cannot be determined from MemoryCache
+                        NextRefreshTime = null, // No refresh for direct cached items
+                        PersistentCacheEnabled = _persistentOptions != null
                     };
 
                     // Add persistent cache information
@@ -1464,16 +1505,21 @@ namespace CacheUtility
                 if (metadata.IsPersisted)
                 {
                     metadata.PersistentFilePath = cacheFilePath;
+                    metadata.PersistentMetaFilePath = metaFilePath;
                     
                     try
                     {
-                        var fileInfo = new FileInfo(cacheFilePath);
-                        metadata.PersistentFileSize = fileInfo.Length;
-                        metadata.LastPersistedTime = fileInfo.LastWriteTime;
+                        var cacheFileInfo = new FileInfo(cacheFilePath);
+                        metadata.PersistentFileSize = cacheFileInfo.Length;
+                        metadata.LastPersistedTime = cacheFileInfo.LastWriteTime;
+
+                        var metaFileInfo = new FileInfo(metaFilePath);
+                        metadata.PersistentMetaFileSize = metaFileInfo.Length;
                     }
                     catch
                     {
                         metadata.PersistentFileSize = 0;
+                        metadata.PersistentMetaFileSize = 0;
                         metadata.LastPersistedTime = null;
                     }
                 }
@@ -1482,6 +1528,22 @@ namespace CacheUtility
             {
                 metadata.IsPersisted = false;
             }
+        }
+
+        /// <summary>
+        /// Calculates the next refresh time based on last refresh time and refresh interval
+        /// </summary>
+        /// <param name="lastRefreshTime">When the item was last refreshed</param>
+        /// <param name="refreshInterval">Auto-refresh interval</param>
+        /// <returns>Next refresh time, or null if no auto-refresh is configured</returns>
+        private static DateTime? CalculateNextRefreshTime(DateTime lastRefreshTime, TimeSpan refreshInterval)
+        {
+            if (refreshInterval <= TimeSpan.Zero || lastRefreshTime == DateTime.MinValue)
+            {
+                return null; // No auto-refresh configured
+            }
+
+            return lastRefreshTime.Add(refreshInterval);
         }
 
         /// <summary>
@@ -1585,10 +1647,7 @@ namespace CacheUtility
         /// </summary>
         public string PopulateMethodName { get; set; }
 
-        /// <summary>
-        /// Name of the removal callback method if one is set
-        /// </summary>
-        public string RemovalCallbackName { get; set; }
+
 
         /// <summary>
         /// Whether this item is persisted to disk
@@ -1609,6 +1668,36 @@ namespace CacheUtility
         /// When the item was last persisted to disk
         /// </summary>
         public DateTime? LastPersistedTime { get; set; }
+
+        /// <summary>
+        /// When the next refresh is scheduled to occur (if auto-refresh is enabled)
+        /// </summary>
+        public DateTime? NextRefreshTime { get; set; }
+
+        /// <summary>
+        /// Whether persistent cache is enabled for this item
+        /// </summary>
+        public bool PersistentCacheEnabled { get; set; }
+
+        /// <summary>
+        /// Path to the metadata file for persistent cache (if persisted)
+        /// </summary>
+        public string PersistentMetaFilePath { get; set; } = string.Empty;
+
+        /// <summary>
+        /// Size of the persistent metadata file in bytes (if persisted)
+        /// </summary>
+        public long PersistentMetaFileSize { get; set; }
+
+        /// <summary>
+        /// Total size of both cache and metadata files in bytes (if persisted)
+        /// </summary>
+        public long TotalPersistentSize => PersistentFileSize + PersistentMetaFileSize;
+
+        /// <summary>
+        /// Age of the persistent cache file (time since last write)
+        /// </summary>
+        public TimeSpan? PersistentFileAge => LastPersistedTime.HasValue ? DateTime.Now - LastPersistedTime.Value : null;
     }
 
     /// <summary>
@@ -1754,6 +1843,46 @@ namespace CacheUtility
         public int MetaFiles { get; set; }
 
         /// <summary>
+        /// When the oldest cache file was created
+        /// </summary>
+        public DateTime? OldestFileTime { get; set; }
+
+        /// <summary>
+        /// When the newest cache file was created
+        /// </summary>
+        public DateTime? NewestFileTime { get; set; }
+
+        /// <summary>
+        /// Average file size in bytes
+        /// </summary>
+        public long AverageFileSize => TotalFiles > 0 ? TotalSizeBytes / TotalFiles : 0;
+
+        /// <summary>
+        /// Size of the largest file in bytes
+        /// </summary>
+        public long LargestFileSize { get; set; }
+
+        /// <summary>
+        /// Size of the smallest file in bytes
+        /// </summary>
+        public long SmallestFileSize { get; set; }
+
+        /// <summary>
+        /// Number of orphaned files (cache files without corresponding metadata files, or vice versa)
+        /// </summary>
+        public int OrphanedFiles { get; set; }
+
+        /// <summary>
+        /// Age of the persistent cache directory (oldest file age)
+        /// </summary>
+        public TimeSpan? DirectoryAge => OldestFileTime.HasValue ? DateTime.Now - OldestFileTime.Value : null;
+
+        /// <summary>
+        /// Time since last cache activity (newest file age)
+        /// </summary>
+        public TimeSpan? TimeSinceLastActivity => NewestFileTime.HasValue ? DateTime.Now - NewestFileTime.Value : null;
+
+        /// <summary>
         /// Total size formatted as human-readable string
         /// </summary>
         public string TotalSizeFormatted
@@ -1764,6 +1893,21 @@ namespace CacheUtility
                 if (TotalSizeBytes < 1024 * 1024) return $"{TotalSizeBytes / 1024:F1} KB";
                 if (TotalSizeBytes < 1024 * 1024 * 1024) return $"{TotalSizeBytes / (1024 * 1024):F1} MB";
                 return $"{TotalSizeBytes / (1024 * 1024 * 1024):F1} GB";
+            }
+        }
+
+        /// <summary>
+        /// Average file size formatted as human-readable string
+        /// </summary>
+        public string AverageFileSizeFormatted
+        {
+            get
+            {
+                var avgSize = AverageFileSize;
+                if (avgSize < 1024) return $"{avgSize} B";
+                if (avgSize < 1024 * 1024) return $"{avgSize / 1024:F1} KB";
+                if (avgSize < 1024 * 1024 * 1024) return $"{avgSize / (1024 * 1024):F1} MB";
+                return $"{avgSize / (1024 * 1024 * 1024):F1} GB";
             }
         }
     }

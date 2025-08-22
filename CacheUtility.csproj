@@ -3,26 +3,31 @@
   <PropertyGroup>
     <TargetFramework>net9.0</TargetFramework>
     <GeneratePackageOnBuild>True</GeneratePackageOnBuild>
-    <Version>1.0.22</Version>
-    <Title>Thread-Safe .NET Memory Cache with Groups, Dependencies &amp; Auto-Population</Title>
+    <Version>1.1.0</Version>
+    <Title>Thread-Safe .NET Memory Cache with Groups, Dependencies, Auto-Population &amp; Persistent Storage</Title>
     <Authors>Onno Pistorius</Authors>
     <Company>Athena ICT</Company>
-    <Description>Thread-safe generic wrapper for System.Runtime.Caching with advanced features including cache groups, dependency management, and automatic population.
+    <Description>Advanced thread-safe generic wrapper for System.Runtime.Caching with comprehensive features including cache groups, dependency management, automatic population, and persistent disk storage.
 
 Key Features:
 • Cache groups for organized data management
-• Dependency relationships between cache groups
+• Dependency relationships between cache groups  
 • Automatic cache population with custom methods
+• Persistent cache storage that survives application restarts
 • Retrieve all items from a group with GetAllByGroup()
+• Comprehensive metadata and monitoring with GetAllCacheMetadata()
+• Detailed statistics and disk usage analysis
 • Multiple expiration strategies (sliding/absolute)
+• Auto-refresh with configurable intervals
 • Thread-safe operations with minimal lock contention
+• JSON-based serialization for persistent storage
 
-Perfect for high-performance applications requiring sophisticated caching patterns and data consistency.</Description>
+Perfect for high-performance applications requiring sophisticated caching patterns, data persistence, and comprehensive monitoring capabilities.</Description>
     <Copyright>Onno Pistorius</Copyright>
     <PackageProjectUrl>https://www.athenaict.com/NuGet/Cache</PackageProjectUrl>
     <PackageIcon>Logo_initials.png</PackageIcon>
-    <PackageTags>cache;caching;memory-cache;thread-safe;cache-groups;cache-dependencies;auto-population;performance;dotnet;system-runtime-caching;cache-management;high-performance;scalability;cache-utility;bulk-retrieval;</PackageTags>
-    <PackageReleaseNotes>Persistent cache storage added for data that survives application restarts; added GetAllCacheMetadata() method for monitoring and debugging. Returns detailed metadata including memory usage, populate method names, refresh status, and collection counts. Perfect for admin dashboards and performance analysis. Fully backward compatible.</PackageReleaseNotes>
+    <PackageTags>cache;caching;memory-cache;persistent-cache;thread-safe;cache-groups;cache-dependencies;auto-population;performance;dotnet;system-runtime-caching;cache-management;high-performance;scalability;cache-utility;bulk-retrieval;monitoring;metadata;statistics;disk-storage;json-serialization;auto-refresh;cache-monitoring;</PackageTags>
+    <PackageReleaseNotes>Major Update v1.1.0: Added persistent cache storage with JSON serialization that survives application restarts. Enhanced monitoring with comprehensive metadata including next refresh times, file ages, and detailed statistics. Added disk usage analysis with file size distribution, orphaned file detection, and cache activity tracking. Improved API with better error handling and performance optimizations. Fully backward compatible with zero performance impact when persistent cache is disabled.</PackageReleaseNotes>
     <PackageId>CacheUtility</PackageId>
     <Product>CacheUtility</Product>
     <PackageLicenseFile>License.txt</PackageLicenseFile>
@@ -48,6 +53,11 @@ Perfect for high-performance applications requiring sophisticated caching patter
       <PackagePath>\</PackagePath>
     </None>
     <None Update="README.md">
+      <PackagePath>\</PackagePath>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Pack>True</Pack>
+    </None>
+    <None Update="CHANGELOG.md">
       <PackagePath>\</PackagePath>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <Pack>True</Pack>
