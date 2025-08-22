@@ -6,12 +6,13 @@ A thread-safe, generic wrapper for System.Runtime.Caching that simplifies cache 
 
 CacheUtility provides an easy-to-use abstraction over the standard .NET memory cache with additional features:
 
-- Automatic cache population
-- Various expiration strategies
-- Thread-safe operations
-- Support for cache groups
-- Dependency relationships between cache groups
-- Automatic background refresh functionality
+- **Automatic cache population** with custom populate methods
+- **Various expiration strategies** (sliding and absolute)
+- **Thread-safe operations** with minimal lock contention
+- **Support for cache groups** for organized data management
+- **Dependency relationships** between cache groups
+- **Automatic background refresh** functionality for non-blocking updates
+- **Persistent cache storage** for data that survives application restarts
 
 ## Basic usage
 
@@ -125,6 +126,176 @@ if (allItems.ContainsKey("MySpecificKey"))
 }
 ```
 
+## Persistent Cache
+
+CacheUtility supports optional persistent caching, where cached data is automatically saved to disk and survives application restarts. This hybrid approach combines the speed of in-memory caching with the persistence of disk storage.
+
+### Enabling persistent cache
+
+Enable persistent cache globally with default settings:
+
+```csharp
+// Enable with default options (%LOCALAPPDATA%/CacheUtility/)
+Cache.EnablePersistentCache();
+
+// All cache operations now automatically persist to disk
+var userData = Cache.Get("userProfile", "users", () => GetUserFromDatabase(userId));
+```
+
+Enable with custom configuration:
+
+```csharp
+// Enable with custom options
+Cache.EnablePersistentCache(new PersistentCacheOptions 
+{
+    BaseDirectory = @"C:\MyApp\Cache",
+    MaxFileSize = 50 * 1024 * 1024 // 50MB limit per file
+});
+```
+
+### How persistent cache works
+
+When persistent cache is enabled:
+
+1. **Memory-first performance**: Cache operations remain fast using in-memory storage
+2. **Automatic persistence**: Data is automatically saved to disk in JSON format
+3. **Seamless fallback**: If memory cache is cleared, data is loaded from disk automatically
+4. **Transparent operation**: All existing cache APIs work exactly the same
+
+### File structure
+
+Persistent cache files are stored with a simple naming pattern:
+
+```
+%LOCALAPPDATA%/CacheUtility/
+├── users_userProfile_123.cache     # Cache data
+├── users_userProfile_123.meta      # Expiration metadata
+├── reports_monthly_2024.cache
+├── reports_monthly_2024.meta
+└── settings_appConfig.cache
+```
+
+### Configuration options
+
+```csharp
+var options = new PersistentCacheOptions
+{
+    BaseDirectory = @"C:\MyApp\Cache",  // Custom cache directory
+    MaxFileSize = 10 * 1024 * 1024      // 10MB max per cached item (0 = no limit)
+};
+
+Cache.EnablePersistentCache(options);
+```
+
+### Persistent cache management
+
+Check if persistent cache is enabled:
+
+```csharp
+bool isEnabled = Cache.IsPersistentCacheEnabled;
+```
+
+Get current configuration:
+
+```csharp
+var options = Cache.GetPersistentCacheOptions();
+if (options != null)
+{
+    Console.WriteLine($"Cache directory: {options.BaseDirectory}");
+    Console.WriteLine($"Max file size: {options.MaxFileSize} bytes");
+}
+```
+
+Get persistent cache statistics:
+
+```csharp
+var stats = Cache.GetPersistentCacheStatistics();
+Console.WriteLine($"Cache enabled: {stats.IsEnabled}");
+Console.WriteLine($"Cache directory: {stats.BaseDirectory}");
+Console.WriteLine($"Total files: {stats.TotalFiles}");
+Console.WriteLine($"Cache files: {stats.CacheFiles}");
+Console.WriteLine($"Meta files: {stats.MetaFiles}");
+Console.WriteLine($"Total size: {stats.TotalSizeFormatted}");
+```
+
+Manually clean up expired files:
+
+```csharp
+// Manually trigger cleanup of expired persistent cache files
+Cache.CleanupExpiredPersistentCache();
+```
+
+Disable persistent cache:
+
+```csharp
+// Disable persistent caching (returns to memory-only)
+Cache.DisablePersistentCache();
+```
+
+### Enhanced metadata for persistent cache
+
+When persistent cache is enabled, cache metadata includes additional information:
+
+```csharp
+var metadata = Cache.GetAllCacheMetadata();
+foreach (var item in metadata)
+{
+    Console.WriteLine($"Key: {item.CacheKey}");
+    Console.WriteLine($"  Is Persisted: {item.IsPersisted}");
+    
+    if (item.IsPersisted)
+    {
+        Console.WriteLine($"  File Path: {item.PersistentFilePath}");
+        Console.WriteLine($"  File Size: {item.PersistentFileSize:N0} bytes");
+        Console.WriteLine($"  Last Persisted: {item.LastPersistedTime:yyyy-MM-dd HH:mm:ss}");
+    }
+}
+```
+
+### Automatic cleanup
+
+Persistent cache automatically manages file cleanup:
+
+- **Background cleanup**: Runs every 30 minutes to remove expired files
+- **Removal operations**: Files are deleted when cache items are removed
+- **Group operations**: Removing a cache group also removes all associated files
+- **Application shutdown**: Proper cleanup when the application exits
+
+### Use cases for persistent cache
+
+**Application restart scenarios:**
+```csharp
+// Enable persistent cache
+Cache.EnablePersistentCache();
+
+// Cache expensive data that should survive restarts
+var expensiveData = Cache.Get("dailyReport", "reports", () => GenerateDailyReport());
+
+// After application restart, data is automatically loaded from disk
+var sameData = Cache.Get("dailyReport", "reports", () => GenerateDailyReport());
+// No need to regenerate - loaded from persistent storage!
+```
+
+**Large dataset caching:**
+```csharp
+// Cache large datasets that might not fit entirely in memory
+var bigData = Cache.Get("dataset_2024", "analytics", () => LoadHugeDataset());
+```
+
+**Cross-session data:**
+```csharp
+// Cache user preferences that should persist across sessions
+var userPrefs = Cache.Get($"prefs_{userId}", "userdata", () => LoadUserPreferences(userId));
+```
+
+### Best practices for persistent cache
+
+1. **Monitor disk usage**: Use `GetPersistentCacheStatistics()` to monitor cache size
+2. **Set size limits**: Configure `MaxFileSize` to prevent extremely large cache files
+3. **Choose appropriate directories**: Use application-specific directories for better organization
+4. **Consider data sensitivity**: Don't cache sensitive data that shouldn't be stored on disk
+5. **Regular cleanup**: Monitor and clean up cache directories in deployment scripts
+
 ### Cache metadata and monitoring
 
 Get detailed metadata about cached items for monitoring, debugging, or displaying in management interfaces:
@@ -170,6 +341,10 @@ Each `CacheItemMetadata` object contains:
 - **CollectionCount**: Number of items if the cached object is a collection
 - **PopulateMethodName**: Name of the method used to populate/refresh the cache item
 - **RemovalCallbackName**: Name of the removal callback method (currently not available due to MemoryCache limitations)
+- **IsPersisted**: Whether this item is persisted to disk (when persistent cache is enabled)
+- **PersistentFilePath**: File path of the persistent cache file (if persisted)
+- **PersistentFileSize**: Size of the persistent cache file in bytes (if persisted)
+- **LastPersistedTime**: When the item was last persisted to disk
 
 #### Populate method names
 
@@ -419,6 +594,13 @@ Cache.RemoveGroup("UserData");
    - Consider performance impact - callbacks are executed synchronously
    - Avoid heavy operations in callbacks to prevent blocking cache operations
    - Use callbacks for logging and monitoring cache behavior
+7. **Configure persistent cache thoughtfully**:
+   - Enable persistent cache for data that should survive application restarts
+   - Set appropriate `MaxFileSize` limits to prevent extremely large cache files
+   - Monitor disk usage with `GetPersistentCacheStatistics()`
+   - Choose secure, application-specific directories for cache storage
+   - Don't cache sensitive data that shouldn't be stored on disk
+   - Consider the JSON serialization overhead for complex objects
 
 ## Performance considerations
 
@@ -428,6 +610,12 @@ Cache.RemoveGroup("UserData");
 - Background refresh uses `Task.Run()` to prevent blocking the main thread.
 - Multiple concurrent refresh requests for the same cache key are automatically deduplicated.
 - Consider memory usage when caching large objects or collections.
+- **Persistent cache performance**:
+  - Memory cache remains the primary storage for optimal performance
+  - File I/O operations are performed asynchronously when possible
+  - JSON serialization overhead is minimal for most data types
+  - Disk storage provides fallback without impacting memory cache speed
+  - Background cleanup runs periodically without blocking cache operations
 
 ## When to use cache groups vs. key prefixes
 

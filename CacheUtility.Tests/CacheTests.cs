@@ -55,7 +55,7 @@ namespace CacheUtility.Tests
         public void GetAllByGroup_WithNullGroupName_ThrowsArgumentNullException()
         {
             // Act & Assert
-            Assert.Throws<ArgumentNullException>(() => Cache.GetAllByGroup(null!));
+            Assert.Throws<ArgumentNullException>(() => Cache.GetAllByGroup(null));
         }
 
         [Fact]
@@ -111,7 +111,7 @@ namespace CacheUtility.Tests
             const string cacheKey = "testKey";
             const string testValue = "testValue";
             bool callbackInvoked = false;
-            CacheEntryRemovedArguments callbackArgs = null;
+            CacheEntryRemovedArguments? callbackArgs = null;
 
             CacheEntryRemovedCallback callback = (args) =>
             {
@@ -159,7 +159,7 @@ namespace CacheUtility.Tests
             const string cacheKey = "testKey";
             const string testValue = "testValue";
             bool callbackInvoked = false;
-            CacheEntryRemovedArguments callbackArgs = null;
+            CacheEntryRemovedArguments? callbackArgs = null;
 
             CacheEntryRemovedCallback callback = (args) =>
             {
@@ -546,6 +546,355 @@ namespace CacheUtility.Tests
         private static string GetTestData()
         {
             return "Test data from named method";
+        }
+
+        [Fact]
+        public void EnablePersistentCache_WithDefaults_EnablesCaching()
+        {
+            // Act
+            Cache.EnablePersistentCache();
+
+            // Assert
+            Assert.True(Cache.IsPersistentCacheEnabled);
+
+            // Cleanup
+            Cache.DisablePersistentCache();
+            Assert.False(Cache.IsPersistentCacheEnabled);
+        }
+
+        [Fact]
+        public void EnablePersistentCache_WithCustomOptions_UseCustomDirectory()
+        {
+            // Arrange
+            var tempDir = Path.Combine(Path.GetTempPath(), "CacheUtilityTest_" + Guid.NewGuid().ToString("N")[..8]);
+            var options = new PersistentCacheOptions
+            {
+                BaseDirectory = tempDir,
+                MaxFileSize = 5 * 1024 * 1024 // 5MB
+            };
+
+            try
+            {
+                // Act
+                Cache.EnablePersistentCache(options);
+
+                // Assert
+                Assert.True(Cache.IsPersistentCacheEnabled);
+                Assert.True(Directory.Exists(tempDir));
+
+                // Test cache operation creates files
+                var result = Cache.Get("testKey", "testGroup", () => "Test Data");
+                Assert.Equal("Test Data", result);
+
+                // Verify files were created
+                var cacheFiles = Directory.GetFiles(tempDir, "*.cache");
+                var metaFiles = Directory.GetFiles(tempDir, "*.meta");
+                
+                Assert.True(cacheFiles.Length > 0, "Cache file should be created");
+                Assert.True(metaFiles.Length > 0, "Meta file should be created");
+            }
+            finally
+            {
+                // Cleanup
+                Cache.DisablePersistentCache();
+                if (Directory.Exists(tempDir))
+                {
+                    Directory.Delete(tempDir, true);
+                }
+            }
+        }
+
+        [Fact]
+        public void PersistentCache_SurvivesMemoryCacheClear()
+        {
+            // Arrange
+            var tempDir = Path.Combine(Path.GetTempPath(), "CacheUtilityTest_" + Guid.NewGuid().ToString("N")[..8]);
+            var options = new PersistentCacheOptions { BaseDirectory = tempDir };
+
+            try
+            {
+                Cache.EnablePersistentCache(options);
+                
+                // Cache some data
+                const string groupName = "persistentTestGroup";
+                const string cacheKey = "persistentKey";
+                const string testData = "Persistent Test Data";
+                
+                var result1 = Cache.Get(cacheKey, groupName, () => testData);
+                Assert.Equal(testData, result1);
+
+                // Verify files were created
+                var cacheFiles = Directory.GetFiles(tempDir, "*.cache");
+                var metaFiles = Directory.GetFiles(tempDir, "*.meta");
+                Assert.True(cacheFiles.Length > 0, "Cache file should be created");
+                Assert.True(metaFiles.Length > 0, "Meta file should be created");
+
+                // Debug: Check file contents
+                var expectedFileName = $"{groupName}_{cacheKey}";
+                var cacheFile = cacheFiles.FirstOrDefault(f => Path.GetFileNameWithoutExtension(f).Contains(expectedFileName));
+                Assert.NotNull(cacheFile);
+                
+                var fileContent = File.ReadAllText(cacheFile);
+                Assert.Contains(testData, fileContent);
+
+                // Clear memory cache only (leave persistent files)
+                Cache.RemoveAllFromMemoryOnly();
+
+                // Verify files still exist after memory cache clear
+                cacheFiles = Directory.GetFiles(tempDir, "*.cache");
+                metaFiles = Directory.GetFiles(tempDir, "*.meta");
+                Assert.True(cacheFiles.Length > 0, "Cache files should still exist after memory cache clear");
+                Assert.True(metaFiles.Length > 0, "Meta files should still exist after memory cache clear");
+
+                // Data should still be available from persistent storage
+                var result2 = Cache.Get(cacheKey, groupName, () => "This should not be called");
+                Assert.Equal(testData, result2);
+            }
+            finally
+            {
+                // Cleanup
+                Cache.DisablePersistentCache();
+                if (Directory.Exists(tempDir))
+                {
+                    Directory.Delete(tempDir, true);
+                }
+            }
+        }
+
+        [Fact]
+        public void PersistentCache_RemovalCleansUpFiles()
+        {
+            // Arrange
+            var tempDir = Path.Combine(Path.GetTempPath(), "CacheUtilityTest_" + Guid.NewGuid().ToString("N")[..8]);
+            var options = new PersistentCacheOptions { BaseDirectory = tempDir };
+
+            try
+            {
+                Cache.EnablePersistentCache(options);
+                
+                const string groupName = "removalTestGroup";
+                const string cacheKey = "removalKey";
+                
+                // Cache some data
+                Cache.Get(cacheKey, groupName, () => "Test Data");
+                
+                // Verify files exist
+                var cacheFiles = Directory.GetFiles(tempDir, "*.cache");
+                var metaFiles = Directory.GetFiles(tempDir, "*.meta");
+                Assert.True(cacheFiles.Length > 0);
+                Assert.True(metaFiles.Length > 0);
+
+                // Remove from cache
+                Cache.Remove(cacheKey, groupName);
+
+                // Verify files are cleaned up
+                cacheFiles = Directory.GetFiles(tempDir, "*.cache");
+                metaFiles = Directory.GetFiles(tempDir, "*.meta");
+                Assert.Empty(cacheFiles);
+                Assert.Empty(metaFiles);
+            }
+            finally
+            {
+                // Cleanup
+                Cache.DisablePersistentCache();
+                if (Directory.Exists(tempDir))
+                {
+                    Directory.Delete(tempDir, true);
+                }
+            }
+        }
+
+        [Fact]
+        public void PersistentCache_GroupRemovalCleansUpFiles()
+        {
+            // Arrange
+            var tempDir = Path.Combine(Path.GetTempPath(), "CacheUtilityTest_" + Guid.NewGuid().ToString("N")[..8]);
+            var options = new PersistentCacheOptions { BaseDirectory = tempDir };
+
+            try
+            {
+                Cache.EnablePersistentCache(options);
+                
+                const string groupName = "groupRemovalTest";
+                
+                // Cache multiple items in the same group
+                Cache.Get("key1", groupName, () => "Data 1");
+                Cache.Get("key2", groupName, () => "Data 2");
+                Cache.Get("key3", groupName, () => "Data 3");
+                
+                // Verify files exist
+                var cacheFiles = Directory.GetFiles(tempDir, "*.cache");
+                var metaFiles = Directory.GetFiles(tempDir, "*.meta");
+                Assert.True(cacheFiles.Length >= 3);
+                Assert.True(metaFiles.Length >= 3);
+
+                // Remove entire group
+                Cache.RemoveGroup(groupName);
+
+                // Verify all files are cleaned up
+                cacheFiles = Directory.GetFiles(tempDir, "*.cache");
+                metaFiles = Directory.GetFiles(tempDir, "*.meta");
+                Assert.Empty(cacheFiles);
+                Assert.Empty(metaFiles);
+            }
+            finally
+            {
+                // Cleanup
+                Cache.DisablePersistentCache();
+                if (Directory.Exists(tempDir))
+                {
+                    Directory.Delete(tempDir, true);
+                }
+            }
+        }
+
+        [Fact]
+        public void PersistentCache_WithComplexData_SerializesCorrectly()
+        {
+            // Arrange
+            var tempDir = Path.Combine(Path.GetTempPath(), "CacheUtilityTest_" + Guid.NewGuid().ToString("N")[..8]);
+            var options = new PersistentCacheOptions { BaseDirectory = tempDir };
+
+            try
+            {
+                Cache.EnablePersistentCache(options);
+                
+                const string groupName = "complexDataTest";
+                const string cacheKey = "complexKey";
+                
+                var complexData = new TestComplexData
+                {
+                    Name = "Test User",
+                    Age = 25,
+                    Items = new[] { "Item1", "Item2", "Item3" },
+                    CreatedDate = DateTime.Now,
+                    IsActive = true
+                };
+                
+                // Cache complex data
+                var result1 = Cache.Get(cacheKey, groupName, () => complexData);
+                Assert.NotNull(result1);
+                Assert.Equal(complexData.Name, result1.Name);
+                Assert.Equal(complexData.Age, result1.Age);
+
+                // Clear memory cache only (leave persistent files)
+                Cache.RemoveAllFromMemoryOnly();
+
+                // Retrieve from persistent storage
+                var result2 = Cache.Get<TestComplexData>(cacheKey, groupName, () => throw new InvalidOperationException("Should not be called"));
+                Assert.NotNull(result2);
+                Assert.Equal(complexData.Name, result2.Name);
+                Assert.Equal(complexData.Age, result2.Age);
+                Assert.Equal(complexData.Items.Length, result2.Items.Length);
+            }
+            finally
+            {
+                // Cleanup
+                Cache.DisablePersistentCache();
+                if (Directory.Exists(tempDir))
+                {
+                    Directory.Delete(tempDir, true);
+                }
+            }
+        }
+
+        [Fact]
+        public void PersistentCache_Statistics_ReturnsCorrectInformation()
+        {
+            // Arrange
+            var tempDir = Path.Combine(Path.GetTempPath(), "CacheUtilityTest_" + Guid.NewGuid().ToString("N")[..8]);
+            var options = new PersistentCacheOptions { BaseDirectory = tempDir };
+
+            try
+            {
+                // Test when disabled
+                var statsDisabled = Cache.GetPersistentCacheStatistics();
+                Assert.False(statsDisabled.IsEnabled);
+                Assert.Equal(0, statsDisabled.TotalFiles);
+
+                // Enable persistent cache
+                Cache.EnablePersistentCache(options);
+                
+                // Test when enabled but empty
+                var statsEmpty = Cache.GetPersistentCacheStatistics();
+                Assert.True(statsEmpty.IsEnabled);
+                Assert.Equal(tempDir, statsEmpty.BaseDirectory);
+                Assert.Equal(0, statsEmpty.TotalFiles);
+
+                // Add some cache items
+                Cache.Get("key1", "group1", () => "value1");
+                Cache.Get("key2", "group1", () => "value2");
+                Cache.Get("key3", "group2", () => new { Data = "complex" });
+
+                // Test statistics with data
+                var statsWithData = Cache.GetPersistentCacheStatistics();
+                Assert.True(statsWithData.IsEnabled);
+                Assert.True(statsWithData.TotalFiles >= 6); // 3 cache + 3 meta files
+                Assert.True(statsWithData.CacheFiles >= 3);
+                Assert.True(statsWithData.MetaFiles >= 3);
+                Assert.True(statsWithData.TotalSizeBytes > 0);
+                Assert.NotEmpty(statsWithData.TotalSizeFormatted);
+            }
+            finally
+            {
+                // Cleanup
+                Cache.DisablePersistentCache();
+                if (Directory.Exists(tempDir))
+                {
+                    Directory.Delete(tempDir, true);
+                }
+            }
+        }
+
+        [Fact]
+        public void PersistentCache_Metadata_IncludesPersistentInformation()
+        {
+            // Arrange
+            var tempDir = Path.Combine(Path.GetTempPath(), "CacheUtilityTest_" + Guid.NewGuid().ToString("N")[..8]);
+            var options = new PersistentCacheOptions { BaseDirectory = tempDir };
+
+            try
+            {
+                Cache.EnablePersistentCache(options);
+                
+                const string groupName = "metadataTest";
+                const string cacheKey = "metadataKey";
+                
+                // Cache some data
+                Cache.Get(cacheKey, groupName, () => "test data");
+
+                // Get metadata
+                var metadata = Cache.GetAllCacheMetadata().ToList();
+                var itemMetadata = metadata.FirstOrDefault(m => m.CacheKey == cacheKey && m.GroupName == groupName);
+                
+                Assert.NotNull(itemMetadata);
+                Assert.True(itemMetadata.IsPersisted);
+                Assert.NotEmpty(itemMetadata.PersistentFilePath);
+                Assert.True(itemMetadata.PersistentFileSize > 0);
+                Assert.NotNull(itemMetadata.LastPersistedTime);
+                Assert.True(File.Exists(itemMetadata.PersistentFilePath));
+            }
+            finally
+            {
+                // Cleanup
+                Cache.DisablePersistentCache();
+                if (Directory.Exists(tempDir))
+                {
+                    Directory.Delete(tempDir, true);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Test class for complex data serialization testing
+        /// </summary>
+        public class TestComplexData
+        {
+            public string Name { get; set; } = string.Empty;
+            public int Age { get; set; }
+            public string[] Items { get; set; } = Array.Empty<string>();
+            public DateTime CreatedDate { get; set; }
+            public bool IsActive { get; set; }
         }
     }
 } 

@@ -4,9 +4,13 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Runtime.Caching;
+using System.Runtime.CompilerServices;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
+
+[assembly: InternalsVisibleTo("CacheUtility.Tests")]
 
 namespace CacheUtility
 {
@@ -34,6 +38,26 @@ namespace CacheUtility
         /// The registered groups
         /// </summary>
         private static readonly Dictionary<string, CacheGroup> RegisteredGroups = new();
+
+        /// <summary>
+        /// Persistent cache configuration options
+        /// </summary>
+        private static PersistentCacheOptions _persistentOptions = null;
+
+        /// <summary>
+        /// Timer for cleaning up expired persistent cache files
+        /// </summary>
+        private static Timer _persistentCleanupTimer = null;
+
+        /// <summary>
+        /// JSON serialization options for persistent cache files
+        /// </summary>
+        private static readonly JsonSerializerOptions CacheJsonOptions = new JsonSerializerOptions
+        {
+            PropertyNameCaseInsensitive = true,
+            WriteIndented = false,
+            DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+        };
 
         /// <summary>
         /// Retrieve an object from the runtime cache. The populate method will fill the cache if the object is not yet created or expired.
@@ -179,6 +203,9 @@ namespace CacheUtility
                     disposeMethod?.Invoke(cacheItem, null);
                 }
 
+                // Remove from persistent cache if enabled
+                RemoveFromPersistentCache(cacheKey);
+
                 RegisteredKeys.Remove(cacheKey);
                 MemoryCache.Default.Remove(cacheKey);
             }
@@ -227,6 +254,37 @@ namespace CacheUtility
         }
 
         /// <summary>
+        /// Clear all CacheItems from memory only, leaving persistent cache intact.
+        /// Used primarily for testing persistent cache functionality.
+        /// </summary>
+        internal static void RemoveAllFromMemoryOnly()
+        {
+            lock (CacheLock)
+            {
+                // Dispose all cache items but don't remove persistent files
+                foreach (var key in RegisteredKeys.Keys.ToList())
+                {
+                    // Get the cache item to dispose any timers
+                    var cacheItem = MemoryCache.Default.Get(key);
+                    if (cacheItem != null && cacheItem.GetType().IsGenericType && 
+                        cacheItem.GetType().GetGenericTypeDefinition() == typeof(CacheItem<>))
+                    {
+                        // Use reflection to call Dispose method
+                        var disposeMethod = cacheItem.GetType().GetMethod("Dispose");
+                        disposeMethod?.Invoke(cacheItem, null);
+                    }
+
+                    // Remove from memory cache and registered keys, but not persistent storage
+                    RegisteredKeys.Remove(key);
+                    MemoryCache.Default.Remove(key);
+                }
+
+                // Clear registered groups
+                RegisteredGroups.Clear();
+            }
+        }
+
+        /// <summary>
         /// Clear all CacheItems that were added by this cache.
         /// Except the CacheItems in the groups specified.
         /// </summary>
@@ -265,16 +323,15 @@ namespace CacheUtility
                     for (var i = 0; i < group.SubKeys.Count; i++)
                     {
                         keys.Add(group.SubKeys[i]);
-                        RegisteredKeys.Remove(group.SubKeys[i]);
                     }
 
                     RegisteredGroups.Remove(groupName);
+                }
 
-                    for (var i = 0; i < keys.Count; i++)
-                    {
-                        MemoryCache.Default.Remove(keys[i]);
-                    }
-
+                // Use RemoveByInternalKey to ensure persistent files are cleaned up
+                for (var i = 0; i < keys.Count; i++)
+                {
+                    RemoveByInternalKey(keys[i]);
                 }
 
                 if (!_dependencies.TryGetValue(groupName, out var dependencies))
@@ -302,6 +359,152 @@ namespace CacheUtility
                 dependenciesList.Add(dependancy);
             }
             _dependencies.Add(groupName, dependenciesList);
+        }
+
+        /// <summary>
+        /// Enable persistent cache with default options
+        /// </summary>
+        public static void EnablePersistentCache()
+        {
+            EnablePersistentCache(new PersistentCacheOptions());
+        }
+
+        /// <summary>
+        /// Enable persistent cache with custom options
+        /// </summary>
+        /// <param name="options">Persistent cache configuration options</param>
+        public static void EnablePersistentCache(PersistentCacheOptions options)
+        {
+            if (options == null) throw new ArgumentNullException(nameof(options));
+
+            lock (CacheLock)
+            {
+                _persistentOptions = options;
+
+                // Ensure cache directory exists
+                if (!Directory.Exists(options.BaseDirectory))
+                {
+                    Directory.CreateDirectory(options.BaseDirectory);
+                }
+
+                // Start cleanup timer if not already running
+                if (_persistentCleanupTimer == null)
+                {
+                    _persistentCleanupTimer = new Timer(CleanupExpiredPersistentFiles, null, 
+                        TimeSpan.FromMinutes(5), TimeSpan.FromMinutes(30));
+                }
+            }
+        }
+
+        /// <summary>
+        /// Disable persistent cache
+        /// </summary>
+        public static void DisablePersistentCache()
+        {
+            lock (CacheLock)
+            {
+                _persistentOptions = null;
+                
+                // Stop cleanup timer
+                _persistentCleanupTimer?.Dispose();
+                _persistentCleanupTimer = null;
+            }
+        }
+
+        /// <summary>
+        /// Check if persistent cache is enabled
+        /// </summary>
+        public static bool IsPersistentCacheEnabled => _persistentOptions != null;
+
+        /// <summary>
+        /// Get persistent cache configuration options
+        /// </summary>
+        /// <returns>Current persistent cache options or null if disabled</returns>
+        public static PersistentCacheOptions GetPersistentCacheOptions()
+        {
+            return _persistentOptions;
+        }
+
+        /// <summary>
+        /// Manually clean up expired persistent cache files
+        /// </summary>
+        public static void CleanupExpiredPersistentCache()
+        {
+            CleanupExpiredPersistentFiles(null);
+        }
+
+        /// <summary>
+        /// Get statistics about persistent cache
+        /// </summary>
+        /// <returns>Persistent cache statistics</returns>
+        public static PersistentCacheStatistics GetPersistentCacheStatistics()
+        {
+            if (_persistentOptions == null)
+            {
+                return new PersistentCacheStatistics
+                {
+                    IsEnabled = false,
+                    BaseDirectory = string.Empty,
+                    TotalFiles = 0,
+                    TotalSizeBytes = 0,
+                    CacheFiles = 0,
+                    MetaFiles = 0
+                };
+            }
+
+            try
+            {
+                if (!Directory.Exists(_persistentOptions.BaseDirectory))
+                {
+                    return new PersistentCacheStatistics
+                    {
+                        IsEnabled = true,
+                        BaseDirectory = _persistentOptions.BaseDirectory,
+                        TotalFiles = 0,
+                        TotalSizeBytes = 0,
+                        CacheFiles = 0,
+                        MetaFiles = 0
+                    };
+                }
+
+                var cacheFiles = Directory.GetFiles(_persistentOptions.BaseDirectory, "*.cache");
+                var metaFiles = Directory.GetFiles(_persistentOptions.BaseDirectory, "*.meta");
+                
+                long totalSize = 0;
+                foreach (var file in cacheFiles.Concat(metaFiles))
+                {
+                    try
+                    {
+                        totalSize += new FileInfo(file).Length;
+                    }
+                    catch
+                    {
+                        // Ignore files that can't be accessed
+                    }
+                }
+
+                return new PersistentCacheStatistics
+                {
+                    IsEnabled = true,
+                    BaseDirectory = _persistentOptions.BaseDirectory,
+                    TotalFiles = cacheFiles.Length + metaFiles.Length,
+                    TotalSizeBytes = totalSize,
+                    CacheFiles = cacheFiles.Length,
+                    MetaFiles = metaFiles.Length
+                };
+            }
+            catch
+            {
+                return new PersistentCacheStatistics
+                {
+                    IsEnabled = true,
+                    BaseDirectory = _persistentOptions.BaseDirectory,
+                    TotalFiles = 0,
+                    TotalSizeBytes = 0,
+                    CacheFiles = 0,
+                    MetaFiles = 0
+                };
+            }
         }
 
         /// <summary>
@@ -340,6 +543,15 @@ namespace CacheUtility
                 if (item != null)
                 {
                     return item.Item; // Another thread created it
+                }
+
+                // Try to load from persistent cache first
+                item = LoadFromPersistentCache<TData>(cacheKey, originalCacheKey, groupName, absoluteExpiration, slidingExpiration);
+                if (item != null)
+                {
+                    // Found in persistent cache, add to memory cache and return
+                    AddToMemoryCache(cacheKey, item, absoluteExpiration, slidingExpiration, priority, removedCallback, refresh);
+                    return item.Item;
                 }
 
                 // Create new cache item
@@ -391,6 +603,9 @@ namespace CacheUtility
                         SetupRefreshTimer(item, cacheKey);
                     }
                 }
+
+                // Save to persistent cache if enabled
+                SaveToPersistentCache(cacheKey, item, absoluteExpiration, slidingExpiration);
 
                 return item.Item;
             }
@@ -475,6 +690,10 @@ namespace CacheUtility
             {
                 cacheItem.Item = newValue;
                 cacheItem.LastRefreshTime = DateTime.Now;
+                
+                // Update persistent cache if enabled
+                var fullCacheKey = $"{cacheItem.GroupName}_{cacheItem.CacheKey}";
+                SaveToPersistentCache(fullCacheKey, cacheItem, DateTime.MaxValue, TimeSpan.Zero);
             }
         }
 
@@ -561,6 +780,293 @@ namespace CacheUtility
             {
                 // If any error occurs in timer callback, dispose the timer to prevent further issues
                 cacheItem?.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// Loads a cache item from persistent storage
+        /// </summary>
+        /// <typeparam name="TData">Cache item type</typeparam>
+        /// <param name="cacheKey">Full cache key</param>
+        /// <param name="originalCacheKey">Original cache key without group prefix</param>
+        /// <param name="groupName">Group name</param>
+        /// <param name="absoluteExpiration">Absolute expiration</param>
+        /// <param name="slidingExpiration">Sliding expiration</param>
+        /// <returns>Cache item if found and valid, null otherwise</returns>
+        private static CacheItem<TData> LoadFromPersistentCache<TData>(string cacheKey, string originalCacheKey, string groupName, DateTime absoluteExpiration, TimeSpan slidingExpiration)
+        {
+            if (_persistentOptions == null) return null;
+
+            try
+            {
+                var cacheFilePath = GetPersistentCacheFilePath(cacheKey);
+                var metaFilePath = GetPersistentCacheMetaFilePath(cacheKey);
+
+                if (!File.Exists(cacheFilePath) || !File.Exists(metaFilePath)) return null;
+
+                // Load metadata first to check expiration
+                var metaJson = File.ReadAllText(metaFilePath);
+                var metadata = JsonSerializer.Deserialize<PersistentCacheMetadata>(metaJson, CacheJsonOptions);
+
+                // Check if expired
+                if (metadata.IsExpired())
+                {
+                    // Remove expired files
+                    File.Delete(cacheFilePath);
+                    File.Delete(metaFilePath);
+                    return null;
+                }
+
+                // Load cache data
+                var dataJson = File.ReadAllText(cacheFilePath);
+                var persistentItem = JsonSerializer.Deserialize<PersistentCacheItem<TData>>(dataJson, CacheJsonOptions);
+
+                if (persistentItem == null || persistentItem.Item == null) return null;
+
+                // Create cache item
+                var cacheItem = new CacheItem<TData>
+                {
+                    Item = persistentItem.Item,
+                    LastRefreshTime = persistentItem.LastRefreshTime,
+                    RefreshInterval = TimeSpan.Zero, // Will be set by caller if needed
+                    CacheKey = originalCacheKey,
+                    GroupName = groupName,
+                    IsRefreshing = false,
+                    LastRefreshAttempt = persistentItem.LastRefreshTime
+                };
+
+                return cacheItem;
+            }
+            catch
+            {
+                // If loading fails, return null to fall back to populate method
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Saves a cache item to persistent storage
+        /// </summary>
+        /// <typeparam name="TData">Cache item type</typeparam>
+        /// <param name="cacheKey">Full cache key</param>
+        /// <param name="cacheItem">Cache item to save</param>
+        /// <param name="absoluteExpiration">Absolute expiration</param>
+        /// <param name="slidingExpiration">Sliding expiration</param>
+        private static void SaveToPersistentCache<TData>(string cacheKey, CacheItem<TData> cacheItem, DateTime absoluteExpiration, TimeSpan slidingExpiration)
+        {
+            if (_persistentOptions == null) return;
+
+            try
+            {
+                var cacheFilePath = GetPersistentCacheFilePath(cacheKey);
+                var metaFilePath = GetPersistentCacheMetaFilePath(cacheKey);
+
+                // Create persistent cache item
+                var persistentItem = new PersistentCacheItem<TData>
+                {
+                    Item = cacheItem.Item,
+                    LastRefreshTime = cacheItem.LastRefreshTime,
+                    CacheKey = cacheItem.CacheKey,
+                    GroupName = cacheItem.GroupName
+                };
+
+                // Create metadata
+                var metadata = new PersistentCacheMetadata
+                {
+                    CreatedTime = DateTime.Now,
+                    AbsoluteExpiration = absoluteExpiration,
+                    SlidingExpiration = slidingExpiration,
+                    LastAccessTime = DateTime.Now
+                };
+
+                // Serialize and save
+                var dataJson = JsonSerializer.Serialize(persistentItem, CacheJsonOptions);
+                var metaJson = JsonSerializer.Serialize(metadata, CacheJsonOptions);
+
+                // Check file size limit
+                if (_persistentOptions.MaxFileSize > 0 && System.Text.Encoding.UTF8.GetByteCount(dataJson) > _persistentOptions.MaxFileSize)
+                {
+                    return; // Skip saving if too large
+                }
+
+                File.WriteAllText(cacheFilePath, dataJson);
+                File.WriteAllText(metaFilePath, metaJson);
+            }
+            catch
+            {
+                // Ignore persistence errors - cache should still work in memory
+            }
+        }
+
+        /// <summary>
+        /// Removes a cache item from persistent storage
+        /// </summary>
+        /// <param name="cacheKey">Full cache key</param>
+        private static void RemoveFromPersistentCache(string cacheKey)
+        {
+            if (_persistentOptions == null) return;
+
+            try
+            {
+                var cacheFilePath = GetPersistentCacheFilePath(cacheKey);
+                var metaFilePath = GetPersistentCacheMetaFilePath(cacheKey);
+
+                if (File.Exists(cacheFilePath)) File.Delete(cacheFilePath);
+                if (File.Exists(metaFilePath)) File.Delete(metaFilePath);
+            }
+            catch
+            {
+                // Ignore deletion errors
+            }
+        }
+
+        /// <summary>
+        /// Adds a cache item to memory cache (helper method)
+        /// </summary>
+        /// <typeparam name="TData">Cache item type</typeparam>
+        /// <param name="cacheKey">Full cache key</param>
+        /// <param name="item">Cache item</param>
+        /// <param name="absoluteExpiration">Absolute expiration</param>
+        /// <param name="slidingExpiration">Sliding expiration</param>
+        /// <param name="priority">Cache priority</param>
+        /// <param name="removedCallback">Removal callback</param>
+        /// <param name="refresh">Refresh interval</param>
+        private static void AddToMemoryCache<TData>(string cacheKey, CacheItem<TData> item, DateTime absoluteExpiration, TimeSpan slidingExpiration, CacheItemPriority priority, CacheEntryRemovedCallback removedCallback, TimeSpan refresh)
+        {
+            lock (CacheLock)
+            {
+                var groupName = item.GroupName;
+
+                if (RegisteredGroups.ContainsKey(groupName))
+                {
+                    RegisteredGroups[groupName].SubKeys.Add(cacheKey);
+                }
+                else
+                {
+                    RegisteredGroups.Add(groupName, new CacheGroup { SubKeys = new List<string> { cacheKey } });
+                }
+
+                // The sliding expiration shouldn't be larger than one year from now
+                var maxSlidingExpiration = DateTime.Now.AddYears(1) - DateTime.Now.AddMinutes(+1);
+                if (slidingExpiration > maxSlidingExpiration)
+                {
+                    slidingExpiration = maxSlidingExpiration;
+                }
+
+                var cacheItemPolicy = new CacheItemPolicy
+                {
+                    AbsoluteExpiration = absoluteExpiration == DateTime.MaxValue ? DateTimeOffset.MaxValue : absoluteExpiration,
+                    SlidingExpiration = slidingExpiration,
+                    Priority = priority,
+                    RemovedCallback = CreateCombinedCallback(removedCallback, item)
+                };
+
+                MemoryCache.Default.Add(cacheKey, item, cacheItemPolicy);
+
+                // Set up refresh timer if refresh interval is specified
+                if (refresh > TimeSpan.Zero)
+                {
+                    item.RefreshInterval = refresh;
+                    SetupRefreshTimer(item, cacheKey);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Gets the file path for persistent cache data
+        /// </summary>
+        /// <param name="cacheKey">Full cache key</param>
+        /// <returns>File path</returns>
+        private static string GetPersistentCacheFilePath(string cacheKey)
+        {
+            var safeFileName = GetSafeFileName(cacheKey);
+            return Path.Combine(_persistentOptions.BaseDirectory, $"{safeFileName}.cache");
+        }
+
+        /// <summary>
+        /// Gets the file path for persistent cache metadata
+        /// </summary>
+        /// <param name="cacheKey">Full cache key</param>
+        /// <returns>File path</returns>
+        private static string GetPersistentCacheMetaFilePath(string cacheKey)
+        {
+            var safeFileName = GetSafeFileName(cacheKey);
+            return Path.Combine(_persistentOptions.BaseDirectory, $"{safeFileName}.meta");
+        }
+
+        /// <summary>
+        /// Converts cache key to safe filename
+        /// </summary>
+        /// <param name="cacheKey">Cache key</param>
+        /// <returns>Safe filename</returns>
+        private static string GetSafeFileName(string cacheKey)
+        {
+            var invalidChars = Path.GetInvalidFileNameChars();
+            var safeFileName = cacheKey;
+            
+            foreach (var c in invalidChars)
+            {
+                safeFileName = safeFileName.Replace(c, '_');
+            }
+            
+            return safeFileName;
+        }
+
+        /// <summary>
+        /// Cleans up expired persistent cache files
+        /// </summary>
+        /// <param name="state">Timer state (unused)</param>
+        private static void CleanupExpiredPersistentFiles(object state)
+        {
+            if (_persistentOptions == null) return;
+
+            try
+            {
+                if (!Directory.Exists(_persistentOptions.BaseDirectory)) return;
+
+                var metaFiles = Directory.GetFiles(_persistentOptions.BaseDirectory, "*.meta");
+                
+                foreach (var metaFile in metaFiles)
+                {
+                    try
+                    {
+                        var metaJson = File.ReadAllText(metaFile);
+                        var metadata = JsonSerializer.Deserialize<PersistentCacheMetadata>(metaJson, CacheJsonOptions);
+
+                        if (metadata.IsExpired())
+                        {
+                            // Remove both meta and cache files
+                            var cacheFile = Path.ChangeExtension(metaFile, ".cache");
+                            
+                            File.Delete(metaFile);
+                            if (File.Exists(cacheFile))
+                            {
+                                File.Delete(cacheFile);
+                            }
+                        }
+                    }
+                    catch
+                    {
+                        // If we can't read the meta file, delete both files
+                        try
+                        {
+                            var cacheFile = Path.ChangeExtension(metaFile, ".cache");
+                            File.Delete(metaFile);
+                            if (File.Exists(cacheFile))
+                            {
+                                File.Delete(cacheFile);
+                            }
+                        }
+                        catch
+                        {
+                            // Ignore cleanup errors
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                // Ignore cleanup errors
             }
         }
 
@@ -700,6 +1206,10 @@ namespace CacheUtility
                 lockSlim.Dispose();
             }
             RegisteredKeys.Clear();
+            
+            // Clean up persistent cache timer
+            _persistentCleanupTimer?.Dispose();
+            _persistentCleanupTimer = null;
         }
 
         /// <summary>
@@ -830,12 +1340,15 @@ namespace CacheUtility
                         RemovalCallbackName = null // Cannot be determined from MemoryCache policy
                     };
 
+                    // Add persistent cache information
+                    PopulatePersistentCacheMetadata(metadata, fullCacheKey);
+
                     return metadata;
                 }
                 else
                 {
                     // Direct cached object (not wrapped in CacheItem<T>)
-                    return new CacheItemMetadata
+                    var metadata = new CacheItemMetadata
                     {
                         CacheKey = originalKey,
                         GroupName = groupName,
@@ -848,6 +1361,11 @@ namespace CacheUtility
                         PopulateMethodName = null, // Unknown for direct cached items
                         RemovalCallbackName = null // Cannot be determined from MemoryCache
                     };
+
+                    // Add persistent cache information
+                    PopulatePersistentCacheMetadata(metadata, fullCacheKey);
+                    
+                    return metadata;
                 }
             }
             catch (Exception)
@@ -869,7 +1387,7 @@ namespace CacheUtility
             try
             {
                 // Use JSON serialization as a rough estimate of object size
-                var json = JsonSerializer.Serialize(obj);
+                var json = JsonSerializer.Serialize(obj, CacheJsonOptions);
                 return System.Text.Encoding.UTF8.GetByteCount(json);
             }
             catch
@@ -919,6 +1437,49 @@ namespace CacheUtility
             }
 
             return null;
+        }
+
+        /// <summary>
+        /// Populates persistent cache metadata for a cache item
+        /// </summary>
+        /// <param name="metadata">Metadata object to populate</param>
+        /// <param name="fullCacheKey">Full cache key including group prefix</param>
+        private static void PopulatePersistentCacheMetadata(CacheItemMetadata metadata, string fullCacheKey)
+        {
+            if (_persistentOptions == null)
+            {
+                metadata.IsPersisted = false;
+                return;
+            }
+
+            try
+            {
+                var cacheFilePath = GetPersistentCacheFilePath(fullCacheKey);
+                var metaFilePath = GetPersistentCacheMetaFilePath(fullCacheKey);
+
+                metadata.IsPersisted = File.Exists(cacheFilePath) && File.Exists(metaFilePath);
+                
+                if (metadata.IsPersisted)
+                {
+                    metadata.PersistentFilePath = cacheFilePath;
+                    
+                    try
+                    {
+                        var fileInfo = new FileInfo(cacheFilePath);
+                        metadata.PersistentFileSize = fileInfo.Length;
+                        metadata.LastPersistedTime = fileInfo.LastWriteTime;
+                    }
+                    catch
+                    {
+                        metadata.PersistentFileSize = 0;
+                        metadata.LastPersistedTime = null;
+                    }
+                }
+            }
+            catch
+            {
+                metadata.IsPersisted = false;
+            }
         }
 
         /// <summary>
@@ -1026,6 +1587,183 @@ namespace CacheUtility
         /// Name of the removal callback method if one is set
         /// </summary>
         public string RemovalCallbackName { get; set; }
+
+        /// <summary>
+        /// Whether this item is persisted to disk
+        /// </summary>
+        public bool IsPersisted { get; set; }
+
+        /// <summary>
+        /// File path of the persistent cache file (if persisted)
+        /// </summary>
+        public string PersistentFilePath { get; set; } = string.Empty;
+
+        /// <summary>
+        /// Size of the persistent cache file in bytes (if persisted)
+        /// </summary>
+        public long PersistentFileSize { get; set; }
+
+        /// <summary>
+        /// When the item was last persisted to disk
+        /// </summary>
+        public DateTime? LastPersistedTime { get; set; }
+    }
+
+    /// <summary>
+    /// Configuration options for persistent cache
+    /// </summary>
+    public class PersistentCacheOptions
+    {
+        /// <summary>
+        /// Base directory for persistent cache files
+        /// </summary>
+        public string BaseDirectory { get; set; }
+
+        /// <summary>
+        /// Maximum file size for cached items (0 = no limit)
+        /// </summary>
+        public long MaxFileSize { get; set; }
+
+        /// <summary>
+        /// Default constructor with sensible defaults
+        /// </summary>
+        public PersistentCacheOptions()
+        {
+            BaseDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CacheUtility");
+            MaxFileSize = 10 * 1024 * 1024; // 10MB default limit
+        }
+    }
+
+    /// <summary>
+    /// Persistent cache item for serialization
+    /// </summary>
+    /// <typeparam name="T">Cached item type</typeparam>
+    [Serializable]
+    public class PersistentCacheItem<T>
+    {
+        /// <summary>
+        /// Cached item
+        /// </summary>
+        public T Item { get; set; }
+
+        /// <summary>
+        /// The last time this cache item was refreshed
+        /// </summary>
+        public DateTime LastRefreshTime { get; set; }
+
+        /// <summary>
+        /// Cache key for this item
+        /// </summary>
+        public string CacheKey { get; set; }
+
+        /// <summary>
+        /// Group name for this item
+        /// </summary>
+        public string GroupName { get; set; }
+    }
+
+    /// <summary>
+    /// Persistent cache metadata for expiration tracking
+    /// </summary>
+    [Serializable]
+    public class PersistentCacheMetadata
+    {
+        /// <summary>
+        /// When the cache item was created
+        /// </summary>
+        public DateTime CreatedTime { get; set; }
+
+        /// <summary>
+        /// Absolute expiration date
+        /// </summary>
+        public DateTime AbsoluteExpiration { get; set; }
+
+        /// <summary>
+        /// Sliding expiration duration
+        /// </summary>
+        public TimeSpan SlidingExpiration { get; set; }
+
+        /// <summary>
+        /// Last time the cache item was accessed
+        /// </summary>
+        public DateTime LastAccessTime { get; set; }
+
+        /// <summary>
+        /// Check if the cache item is expired
+        /// </summary>
+        /// <returns>True if expired, false otherwise</returns>
+        public bool IsExpired()
+        {
+            var now = DateTime.Now;
+
+            // Check absolute expiration
+            if (AbsoluteExpiration != DateTime.MaxValue && now > AbsoluteExpiration)
+            {
+                return true;
+            }
+
+            // Check sliding expiration
+            if (SlidingExpiration > TimeSpan.Zero)
+            {
+                var timeSinceLastAccess = now - LastAccessTime;
+                if (timeSinceLastAccess > SlidingExpiration)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Statistics about persistent cache usage
+    /// </summary>
+    public class PersistentCacheStatistics
+    {
+        /// <summary>
+        /// Whether persistent cache is enabled
+        /// </summary>
+        public bool IsEnabled { get; set; }
+
+        /// <summary>
+        /// Base directory for persistent cache files
+        /// </summary>
+        public string BaseDirectory { get; set; } = string.Empty;
+
+        /// <summary>
+        /// Total number of files in cache directory
+        /// </summary>
+        public int TotalFiles { get; set; }
+
+        /// <summary>
+        /// Total size of all cache files in bytes
+        /// </summary>
+        public long TotalSizeBytes { get; set; }
+
+        /// <summary>
+        /// Number of cache data files
+        /// </summary>
+        public int CacheFiles { get; set; }
+
+        /// <summary>
+        /// Number of metadata files
+        /// </summary>
+        public int MetaFiles { get; set; }
+
+        /// <summary>
+        /// Total size formatted as human-readable string
+        /// </summary>
+        public string TotalSizeFormatted
+        {
+            get
+            {
+                if (TotalSizeBytes < 1024) return $"{TotalSizeBytes} B";
+                if (TotalSizeBytes < 1024 * 1024) return $"{TotalSizeBytes / 1024:F1} KB";
+                if (TotalSizeBytes < 1024 * 1024 * 1024) return $"{TotalSizeBytes / (1024 * 1024):F1} MB";
+                return $"{TotalSizeBytes / (1024 * 1024 * 1024):F1} GB";
+            }
+        }
     }
 }
 

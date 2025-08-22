@@ -3,7 +3,7 @@
   <PropertyGroup>
     <TargetFramework>net9.0</TargetFramework>
     <GeneratePackageOnBuild>True</GeneratePackageOnBuild>
-    <Version>1.0.21</Version>
+    <Version>1.0.22</Version>
     <Title>Thread-Safe .NET Memory Cache with Groups, Dependencies &amp; Auto-Population</Title>
     <Authors>Onno Pistorius</Authors>
     <Company>Athena ICT</Company>
@@ -22,7 +22,7 @@ Perfect for high-performance applications requiring sophisticated caching patter
     <PackageProjectUrl>https://www.athenaict.com/NuGet/Cache</PackageProjectUrl>
     <PackageIcon>Logo_initials.png</PackageIcon>
     <PackageTags>cache;caching;memory-cache;thread-safe;cache-groups;cache-dependencies;auto-population;performance;dotnet;system-runtime-caching;cache-management;high-performance;scalability;cache-utility;bulk-retrieval;</PackageTags>
-    <PackageReleaseNotes>Added GetAllCacheMetadata() method for monitoring and debugging. Returns detailed metadata including memory usage, populate method names, refresh status, and collection counts. Perfect for admin dashboards and performance analysis. Fully backward compatible.</PackageReleaseNotes>
+    <PackageReleaseNotes>Persistent cache storage added for data that survives application restarts; added GetAllCacheMetadata() method for monitoring and debugging. Returns detailed metadata including memory usage, populate method names, refresh status, and collection counts. Perfect for admin dashboards and performance analysis. Fully backward compatible.</PackageReleaseNotes>
     <PackageId>CacheUtility</PackageId>
     <Product>CacheUtility</Product>
     <PackageLicenseFile>License.txt</PackageLicenseFile>
