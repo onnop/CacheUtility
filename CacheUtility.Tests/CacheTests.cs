@@ -885,6 +885,111 @@ namespace CacheUtility.Tests
             }
         }
 
+        [Fact]
+        public void PersistentCache_NoPerformanceImpact_WhenDisabled()
+        {
+            // Ensure persistent cache is disabled
+            Cache.DisablePersistentCache();
+            Assert.False(Cache.IsPersistentCacheEnabled);
+
+            // Test 1: Cache misses with persistent cache disabled
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            for (int i = 0; i < 1000; i++)
+            {
+                var data = Cache.Get($"miss_key_{i}", "perftest_disabled", () => $"data_{i}");
+            }
+            sw.Stop();
+            var timeMissesDisabled = sw.ElapsedMilliseconds;
+
+            // Test 2: Cache hits with persistent cache disabled
+            sw.Restart();
+            for (int i = 0; i < 1000; i++)
+            {
+                var data = Cache.Get($"miss_key_{i % 100}", "perftest_disabled", () => $"should_not_be_called_{i}");
+            }
+            sw.Stop();
+            var timeHitsDisabled = sw.ElapsedMilliseconds;
+
+            // Cache hits should be significantly faster than cache misses
+            Assert.True(timeHitsDisabled < timeMissesDisabled / 2, 
+                $"Cache hits not fast enough: {timeHitsDisabled}ms vs {timeMissesDisabled}ms for misses");
+
+            // Cache hits should be very fast (under 100ms for 1000 operations)
+            Assert.True(timeHitsDisabled < 100, 
+                $"Cache hits too slow when persistent disabled: {timeHitsDisabled}ms");
+
+            // Cache misses should be reasonable (under 1000ms for 1000 operations)
+            Assert.True(timeMissesDisabled < 1000, 
+                $"Cache misses too slow when persistent disabled: {timeMissesDisabled}ms");
+
+            // Cleanup
+            Cache.RemoveGroup("perftest_disabled");
+        }
+
+        [Fact]
+        public void PersistentCache_PerformanceComparison_EnabledVsDisabled()
+        {
+            var tempDir = Path.Combine(Path.GetTempPath(), "CacheUtilityPerfTest_" + Guid.NewGuid().ToString("N")[..8]);
+            
+            try
+            {
+                // Test cache hits performance - should be nearly identical
+                
+                // First with persistent cache disabled
+                Cache.DisablePersistentCache();
+                
+                // Pre-populate cache
+                for (int i = 0; i < 100; i++)
+                {
+                    Cache.Get($"hit_key_{i}", "hitgroup_disabled", () => $"data_{i}");
+                }
+
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                for (int i = 0; i < 1000; i++)
+                {
+                    var data = Cache.Get($"hit_key_{i % 100}", "hitgroup_disabled", () => $"should_not_be_called");
+                }
+                sw.Stop();
+                var hitTimeDisabled = sw.ElapsedMilliseconds;
+
+                // Now with persistent cache enabled
+                Cache.EnablePersistentCache(new PersistentCacheOptions { BaseDirectory = tempDir });
+                
+                // Pre-populate cache
+                for (int i = 0; i < 100; i++)
+                {
+                    Cache.Get($"hit_key_{i}", "hitgroup_enabled", () => $"data_{i}");
+                }
+
+                sw.Restart();
+                for (int i = 0; i < 1000; i++)
+                {
+                    var data = Cache.Get($"hit_key_{i % 100}", "hitgroup_enabled", () => $"should_not_be_called");
+                }
+                sw.Stop();
+                var hitTimeEnabled = sw.ElapsedMilliseconds;
+
+                // Cache hits should have minimal performance difference
+                // Allow up to 2x difference (very generous), but handle case where both are 0ms
+                var maxAllowedTime = Math.Max(hitTimeDisabled * 2, 1); // At least 1ms tolerance
+                Assert.True(hitTimeEnabled <= maxAllowedTime, 
+                    $"Cache hits much slower with persistent enabled: {hitTimeEnabled}ms vs {hitTimeDisabled}ms disabled");
+
+                // Both should be fast (under 100ms for 1000 operations)
+                Assert.True(hitTimeDisabled < 100, $"Cache hits too slow when disabled: {hitTimeDisabled}ms");
+                Assert.True(hitTimeEnabled < 200, $"Cache hits too slow when enabled: {hitTimeEnabled}ms");
+            }
+            finally
+            {
+                // Cleanup
+                Cache.DisablePersistentCache();
+                if (Directory.Exists(tempDir))
+                {
+                    Directory.Delete(tempDir, true);
+                }
+            }
+        }
+
         /// <summary>
         /// Test class for complex data serialization testing
         /// </summary>

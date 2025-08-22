@@ -802,7 +802,9 @@ namespace CacheUtility
                 var cacheFilePath = GetPersistentCacheFilePath(cacheKey);
                 var metaFilePath = GetPersistentCacheMetaFilePath(cacheKey);
 
-                if (!File.Exists(cacheFilePath) || !File.Exists(metaFilePath)) return null;
+                // Quick check: if cache file doesn't exist, don't bother checking meta file
+                if (!File.Exists(cacheFilePath)) return null;
+                if (!File.Exists(metaFilePath)) return null;
 
                 // Load metadata first to check expiration
                 var metaJson = File.ReadAllText(metaFilePath);
