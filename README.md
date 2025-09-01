@@ -47,8 +47,12 @@ using CacheUtility;
 // Simple caching with automatic population
 var userData = Cache.Get("user_123", "users", () => GetUserFromDatabase(123));
 
-// Enable persistent cache (optional)
-Cache.EnablePersistentCache();
+// Enable persistent cache for specific groups
+var options = new PersistentCacheOptions
+{
+    PersistentGroups = new[] { "users", "settings" }
+};
+Cache.EnablePersistentCache(options);
 
 // Cache with auto-refresh every 5 minutes
 var config = Cache.Get("app_config", "settings", 
@@ -175,14 +179,19 @@ CacheUtility supports optional persistent caching, where cached data is automati
 
 ### Enabling persistent cache
 
-Enable persistent cache globally with default settings:
+Enable persistent cache for specific groups:
 
 ```csharp
-// Enable with default options (%LOCALAPPDATA%/CacheUtility/)
-Cache.EnablePersistentCache();
+// Enable persistence for specific cache groups
+var options = new PersistentCacheOptions
+{
+    PersistentGroups = new[] { "users", "settings", "products" }
+};
+Cache.EnablePersistentCache(options);
 
-// All cache operations now automatically persist to disk
-var userData = Cache.Get("userProfile", "users", () => GetUserFromDatabase(userId));
+// Only specified groups will persist to disk
+var userData = Cache.Get("userProfile", "users", () => GetUserFromDatabase(userId)); // Persisted
+var tempData = Cache.Get("temp", "temporary", () => GetTempData()); // NOT persisted
 ```
 
 Enable with custom configuration:
@@ -192,7 +201,8 @@ Enable with custom configuration:
 Cache.EnablePersistentCache(new PersistentCacheOptions 
 {
     BaseDirectory = @"C:\MyApp\Cache",
-    MaxFileSize = 50 * 1024 * 1024 // 50MB limit per file
+    MaxFileSize = 50 * 1024 * 1024, // 50MB limit per file
+    PersistentGroups = new[] { "users", "settings" } // Only these groups persist
 });
 ```
 
@@ -324,8 +334,12 @@ Persistent cache automatically manages file cleanup:
 
 **Application restart scenarios:**
 ```csharp
-// Enable persistent cache
-Cache.EnablePersistentCache();
+// Enable persistent cache for a specific group
+var options = new PersistentCacheOptions
+{
+    PersistentGroups = new[] { "user-sessions" }
+};
+Cache.EnablePersistentCache(options);
 
 // Cache expensive data that should survive restarts
 var expensiveData = Cache.Get("dailyReport", "reports", () => GenerateDailyReport());

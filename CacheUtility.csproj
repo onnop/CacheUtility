@@ -3,7 +3,7 @@
   <PropertyGroup>
     <TargetFramework>net9.0</TargetFramework>
     <GeneratePackageOnBuild>True</GeneratePackageOnBuild>
-    <Version>1.1.0</Version>
+    <Version>1.2.0</Version>
     <Title>Thread-Safe .NET Memory Cache with Groups, Dependencies, Auto-Population &amp; Persistent Storage</Title>
     <Authors>Onno Pistorius</Authors>
     <Company>Athena ICT</Company>
@@ -27,7 +27,7 @@ Perfect for high-performance applications requiring sophisticated caching patter
     <PackageProjectUrl>https://www.athenaict.com/NuGet/Cache</PackageProjectUrl>
     <PackageIcon>Logo_initials.png</PackageIcon>
     <PackageTags>cache;caching;memory-cache;persistent-cache;thread-safe;cache-groups;cache-dependencies;auto-population;performance;dotnet;system-runtime-caching;cache-management;high-performance;scalability;cache-utility;bulk-retrieval;monitoring;metadata;statistics;disk-storage;json-serialization;auto-refresh;cache-monitoring;</PackageTags>
-    <PackageReleaseNotes>Major Update v1.1.0: Added persistent cache storage with JSON serialization that survives application restarts. Enhanced monitoring with comprehensive metadata including next refresh times, file ages, and detailed statistics. Added disk usage analysis with file size distribution, orphaned file detection, and cache activity tracking. Improved API with better error handling and performance optimizations. Fully backward compatible with zero performance impact when persistent cache is disabled.</PackageReleaseNotes>
+    <PackageReleaseNotes>Update v1.2.0: Improved selective persistence with cleaner API design. Consolidated configuration into PersistentCacheOptions with string array support. </PackageReleaseNotes>
     <PackageId>CacheUtility</PackageId>
     <Product>CacheUtility</Product>
     <PackageLicenseFile>License.txt</PackageLicenseFile>

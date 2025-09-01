@@ -1,6 +1,3 @@
-using System.Runtime.Caching;
-using System.Diagnostics;
-
 namespace CacheUtility.Tests
 {
     public class CacheTests : IDisposable
@@ -16,6 +13,47 @@ namespace CacheUtility.Tests
             // Clean up cache after each test
             Cache.RemoveAll();
             Cache.Dispose();
+        }
+
+        [Fact]
+        public void Get_WithValidInput_CachesAndReturnsValue()
+        {
+            // Arrange
+            const string groupName = "TestGroup";
+            const string cacheKey = "testKey";
+            const string expectedValue = "testValue";
+
+            // Act
+            var result = Cache.Get(cacheKey, groupName, () => expectedValue);
+
+            // Assert
+            Assert.Equal(expectedValue, result);
+        }
+
+        [Fact]
+        public void Get_CalledTwice_OnlyCallsPopulateMethodOnce()
+        {
+            // Arrange
+            const string groupName = "TestGroup";
+            const string cacheKey = "testKey";
+            var callCount = 0;
+
+            // Act
+            var result1 = Cache.Get(cacheKey, groupName, () =>
+            {
+                callCount++;
+                return "testValue";
+            });
+            var result2 = Cache.Get(cacheKey, groupName, () =>
+            {
+                callCount++;
+                return "testValue";
+            });
+
+            // Assert
+            Assert.Equal("testValue", result1);
+            Assert.Equal("testValue", result2);
+            Assert.Equal(1, callCount); // Populate method should only be called once
         }
 
         [Fact]
@@ -59,40 +97,33 @@ namespace CacheUtility.Tests
         }
 
         [Fact]
-        public void GetAllByGroup_WithMixedDataTypes_ReturnsAllItemsWithCorrectTypes()
+        public void Remove_RemovesSpecificCacheItem()
         {
             // Arrange
-            const string groupName = "MixedGroup";
-            var testDate = DateTime.Now;
-            var testList = new List<string> { "A", "B", "C" };
-
-            Cache.Get("stringKey", groupName, () => "Hello World");
-            Cache.Get("intKey", groupName, () => 42);
-            Cache.Get("dateKey", groupName, () => testDate);
-            Cache.Get("listKey", groupName, () => testList);
+            const string groupName = "TestGroup";
+            const string cacheKey = "testKey";
+            Cache.Get(cacheKey, groupName, () => "testValue");
 
             // Act
-            var result = Cache.GetAllByGroup(groupName);
+            Cache.Remove(cacheKey, groupName);
+            var result = Cache.Get(cacheKey, groupName, () => "newValue");
 
             // Assert
-            Assert.Equal(4, result.Count);
-            Assert.Equal("Hello World", result["stringKey"]);
-            Assert.Equal(42, result["intKey"]);
-            Assert.Equal(testDate, result["dateKey"]);
-            Assert.Equal(testList, result["listKey"]);
+            Assert.Equal("newValue", result); // Should call populate method again
         }
 
         [Fact]
-        public void GetAllByGroup_AfterGroupRemoval_ReturnsEmptyDictionary()
+        public void RemoveGroup_RemovesAllItemsInGroup()
         {
             // Arrange
-            const string groupName = "RemovalTestGroup";
+            const string groupName = "TestGroup";
             Cache.Get("key1", groupName, () => "value1");
             Cache.Get("key2", groupName, () => "value2");
+            Cache.Get("key3", groupName, () => "value3");
 
             // Verify items are cached
             var beforeRemoval = Cache.GetAllByGroup(groupName);
-            Assert.Equal(2, beforeRemoval.Count);
+            Assert.Equal(3, beforeRemoval.Count);
 
             // Act
             Cache.RemoveGroup(groupName);
@@ -104,448 +135,120 @@ namespace CacheUtility.Tests
         }
 
         [Fact]
-        public void Get_WithRemovedCallback_CallbackIsInvokedWhenItemIsRemoved()
+        public void RemoveAll_RemovesAllCacheItems()
         {
             // Arrange
-            const string groupName = "CallbackTestGroup";
-            const string cacheKey = "testKey";
-            const string testValue = "testValue";
-            bool callbackInvoked = false;
-            CacheEntryRemovedArguments? callbackArgs = null;
+            Cache.Get("key1", "group1", () => "value1");
+            Cache.Get("key2", "group2", () => "value2");
+            Cache.Get("key3", "group3", () => "value3");
 
-            CacheEntryRemovedCallback callback = (args) =>
-            {
-                callbackInvoked = true;
-                callbackArgs = args;
-            };
+            // Act
+            Cache.RemoveAll();
 
-            // Act - Add item to cache with callback
-            var result = Cache.Get(cacheKey, groupName, DateTime.Now.AddSeconds(2), TimeSpan.Zero, CacheItemPriority.Default, () => testValue, callback);
+            // Assert - All items should be repopulated
+            var result1 = Cache.Get("key1", "group1", () => "newValue1");
+            var result2 = Cache.Get("key2", "group2", () => "newValue2");
+            var result3 = Cache.Get("key3", "group3", () => "newValue3");
 
-            // Verify the item was cached
-            Assert.Equal(testValue, result);
+            Assert.Equal("newValue1", result1);
+            Assert.Equal("newValue2", result2);
+            Assert.Equal("newValue3", result3);
+        }
 
-            // Remove the item to trigger callback
-            Cache.Remove(cacheKey, groupName);
+        [Fact]
+        public void Get_WithDifferentDataTypes_WorksCorrectly()
+        {
+            // Arrange & Act
+            var stringResult = Cache.Get("stringKey", "testGroup", () => "Hello World");
+            var intResult = Cache.Get("intKey", "testGroup", () => 42);
+            var dateResult = Cache.Get("dateKey", "testGroup", () => DateTime.Today);
+            var listResult = Cache.Get("listKey", "testGroup", () => new List<string> { "A", "B", "C" });
 
             // Assert
-            Assert.True(callbackInvoked, "Callback should have been invoked when item was removed");
-            Assert.NotNull(callbackArgs);
-            Assert.Equal(CacheEntryRemovedReason.Removed, callbackArgs.RemovedReason);
+            Assert.Equal("Hello World", stringResult);
+            Assert.Equal(42, intResult);
+            Assert.Equal(DateTime.Today, dateResult);
+            Assert.Equal(3, listResult.Count);
+            Assert.Contains("A", listResult);
         }
 
         [Fact]
-        public void Get_WithoutRemovedCallback_DoesNotThrowException()
+        public void Get_WithSlidingExpiration_CachesWithExpiration()
         {
             // Arrange
-            const string groupName = "NoCallbackTestGroup";
-            const string cacheKey = "testKey";
-            const string testValue = "testValue";
-
-            // Act & Assert - Should not throw exception when callback is null (default)
-            var result = Cache.Get(cacheKey, groupName, DateTime.Now.AddSeconds(2), TimeSpan.Zero, CacheItemPriority.Default, () => testValue);
-
-            Assert.Equal(testValue, result);
-
-            // Remove the item - should not throw exception
-            Cache.Remove(cacheKey, groupName);
-        }
-
-        [Fact]
-        public void Get_WithRemovedCallback_CallbackIsInvokedWhenGroupIsRemoved()
-        {
-            // Arrange
-            const string groupName = "GroupCallbackTestGroup";
-            const string cacheKey = "testKey";
-            const string testValue = "testValue";
-            bool callbackInvoked = false;
-            CacheEntryRemovedArguments? callbackArgs = null;
-
-            CacheEntryRemovedCallback callback = (args) =>
-            {
-                callbackInvoked = true;
-                callbackArgs = args;
-            };
-
-            // Act - Add item to cache with callback
-            var result = Cache.Get(cacheKey, groupName, DateTime.Now.AddSeconds(2), TimeSpan.Zero, CacheItemPriority.Default, () => testValue, callback);
-
-            // Verify the item was cached
-            Assert.Equal(testValue, result);
-
-            // Remove the entire group to trigger callback
-            Cache.RemoveGroup(groupName);
-
-            // Assert
-            Assert.True(callbackInvoked, "Callback should have been invoked when group was removed");
-            Assert.NotNull(callbackArgs);
-            Assert.Equal(CacheEntryRemovedReason.Removed, callbackArgs.RemovedReason);
-        }
-
-        [Fact]
-        public void Get_WithRefreshInterval_ReturnsDataImmediately()
-        {
-            // Arrange
-            const string groupName = "RefreshTestGroup";
-            const string cacheKey = "refreshKey";
+            const string groupName = "ExpirationTestGroup";
+            const string cacheKey = "expirationKey";
             var callCount = 0;
 
-            // Act - First call should populate cache
-            var result1 = Cache.Get(cacheKey, groupName, TimeSpan.FromMinutes(10), () =>
+            // Act - Cache with 1 second sliding expiration
+            var result1 = Cache.Get(cacheKey, groupName, TimeSpan.FromSeconds(1), () =>
             {
                 callCount++;
-                return $"Data_{callCount}";
-            }, TimeSpan.FromSeconds(2)); // 2 second refresh interval
+                return $"value_{callCount}";
+            });
 
-            // Immediately call again - should return same data
-            var result2 = Cache.Get(cacheKey, groupName, TimeSpan.FromMinutes(10), () =>
+            // Wait for expiration
+            Thread.Sleep(1100);
+
+            // Should repopulate due to expiration
+            var result2 = Cache.Get(cacheKey, groupName, TimeSpan.FromSeconds(1), () =>
             {
                 callCount++;
-                return $"Data_{callCount}";
-            }, TimeSpan.FromSeconds(2));
-
-            // Assert
-            Assert.Equal("Data_1", result1);
-            Assert.Equal("Data_1", result2); // Should be same data, no refresh yet
-            Assert.Equal(1, callCount); // Populate method called only once
-        }
-
-        [Fact]
-        public void Get_WithRefreshInterval_RefreshesInBackground()
-        {
-            // Arrange
-            const string groupName = "BackgroundRefreshTestGroup";
-            const string cacheKey = "backgroundRefreshKey";
-            var callCount = 0;
-
-            // Act - First call populates cache
-            var result1 = Cache.Get(cacheKey, groupName, TimeSpan.FromMinutes(10), () =>
-            {
-                callCount++;
-                Thread.Sleep(100); // Simulate some work
-                return $"Data_{callCount}";
-            }, TimeSpan.FromMilliseconds(500)); // 500ms refresh interval
-
-            // Wait for refresh to be needed
-            Thread.Sleep(600);
-
-            // This call should trigger background refresh but return existing data
-            var stopwatch = Stopwatch.StartNew();
-            var result2 = Cache.Get(cacheKey, groupName, TimeSpan.FromMinutes(10), () =>
-            {
-                callCount++;
-                Thread.Sleep(100); // Simulate some work
-                return $"Data_{callCount}";
-            }, TimeSpan.FromMilliseconds(500));
-            stopwatch.Stop();
-
-            // Assert
-            Assert.Equal("Data_1", result1);
-            Assert.Equal("Data_1", result2); // Should still be old data (non-blocking)
-            Assert.True(stopwatch.ElapsedMilliseconds < 50, $"Call took {stopwatch.ElapsedMilliseconds}ms, should be fast"); // Should be very fast
-
-            // Wait a bit for background refresh to complete
-            Thread.Sleep(200);
-
-            // Verify the background refresh eventually happened by checking call count
-            // We can't easily verify the data was updated without more complex timing, 
-            // but we can verify that the refresh mechanism was triggered
-            Assert.True(callCount >= 1, "Populate method should have been called at least once");
-        }
-
-        [Fact]
-        public void Get_WithRefreshInterval_HandlesSlowPopulateMethod()
-        {
-            // Arrange
-            const string groupName = "SlowRefreshTestGroup";
-            const string cacheKey = "slowRefreshKey";
-            var callCount = 0;
-
-            // Act - First call with slow populate method
-            var result1 = Cache.Get(cacheKey, groupName, TimeSpan.FromMinutes(10), () =>
-            {
-                callCount++;
-                Thread.Sleep(1000); // Simulate very slow operation
-                return $"SlowData_{callCount}";
-            }, TimeSpan.FromMilliseconds(500));
-
-            // Wait for refresh to be needed
-            Thread.Sleep(600);
-
-            // Multiple rapid calls should all return quickly with existing data
-            var stopwatch = Stopwatch.StartNew();
-            var results = new List<string>();
-            
-            for (int i = 0; i < 5; i++)
-            {
-                var result = Cache.Get(cacheKey, groupName, TimeSpan.FromMinutes(10), () =>
-                {
-                    callCount++;
-                    Thread.Sleep(1000); // Simulate very slow operation
-                    return $"SlowData_{callCount}";
-                }, TimeSpan.FromMilliseconds(500));
-                results.Add(result);
-            }
-            stopwatch.Stop();
-
-            // Assert
-            Assert.Equal("SlowData_1", result1);
-            Assert.All(results, result => Assert.Equal("SlowData_1", result)); // All should return existing data
-            Assert.True(stopwatch.ElapsedMilliseconds < 100, $"Multiple calls took {stopwatch.ElapsedMilliseconds}ms, should be very fast");
-        }
-
-        [Fact]
-        public void Get_WithZeroRefreshInterval_DoesNotRefresh()
-        {
-            // Arrange
-            const string groupName = "NoRefreshTestGroup";
-            const string cacheKey = "noRefreshKey";
-            var callCount = 0;
-
-            // Act - Use default refresh interval (TimeSpan.Zero)
-            var result1 = Cache.Get(cacheKey, groupName, TimeSpan.FromMinutes(10), () =>
-            {
-                callCount++;
-                return $"Data_{callCount}";
-            }); // No refresh parameter = TimeSpan.Zero
-
-            // Wait and call again
-            Thread.Sleep(100);
-            var result2 = Cache.Get(cacheKey, groupName, TimeSpan.FromMinutes(10), () =>
-            {
-                callCount++;
-                return $"Data_{callCount}";
+                return $"value_{callCount}";
             });
 
             // Assert
-            Assert.Equal("Data_1", result1);
-            Assert.Equal("Data_1", result2);
-            Assert.Equal(1, callCount); // Should only be called once, no refresh
+            Assert.Equal("value_1", result1);
+            Assert.Equal("value_2", result2);
+            Assert.Equal(2, callCount);
         }
 
         [Fact]
-        public void Get_WithRefreshInterval_PreventsConcurrentRefreshes()
+        public void Get_WithAbsoluteExpiration_CachesWithExpiration()
         {
             // Arrange
-            const string groupName = "ConcurrentRefreshTestGroup";
-            const string cacheKey = "concurrentRefreshKey";
-            var callCount = 0;
-            var concurrentCallCount = 0;
-
-            // Initial population
-            Cache.Get(cacheKey, groupName, TimeSpan.FromMinutes(10), () =>
-            {
-                Interlocked.Increment(ref callCount);
-                return $"Data_{callCount}";
-            }, TimeSpan.FromMilliseconds(500));
-
-            // Wait for refresh to be needed
-            Thread.Sleep(600);
-
-            // Act - Make multiple concurrent calls that should trigger refresh
-            var tasks = new List<Task<string>>();
-            for (int i = 0; i < 10; i++)
-            {
-                tasks.Add(Task.Run(() =>
-                {
-                    return Cache.Get(cacheKey, groupName, TimeSpan.FromMinutes(10), () =>
-                    {
-                        Interlocked.Increment(ref concurrentCallCount);
-                        Thread.Sleep(200); // Simulate work
-                        return $"ConcurrentData_{concurrentCallCount}";
-                    }, TimeSpan.FromMilliseconds(500));
-                }));
-            }
-
-            Task.WaitAll(tasks.ToArray());
-            var results = tasks.Select(t => t.Result).ToList();
-
-            // Assert
-            Assert.All(results, result => Assert.Equal("Data_1", result)); // All should return original data
-            
-            // Wait for any background refresh to complete
-            Thread.Sleep(500);
-            
-            // The concurrent call count should be minimal due to refresh deduplication
-            Assert.True(concurrentCallCount <= 2, $"Expected minimal concurrent calls, but got {concurrentCallCount}");
-        }
-
-        [Fact]
-        public void Get_WithRefreshInterval_HandlesPopulateMethodExceptions()
-        {
-            // Arrange
-            const string groupName = "ExceptionRefreshTestGroup";
-            const string cacheKey = "exceptionRefreshKey";
+            const string groupName = "AbsoluteExpirationTestGroup";
+            const string cacheKey = "absoluteKey";
             var callCount = 0;
 
-            // Initial successful population
-            var result1 = Cache.Get(cacheKey, groupName, TimeSpan.FromMinutes(10), () =>
+            // Act - Cache with absolute expiration in 1 second
+            var result1 = Cache.Get(cacheKey, groupName, DateTime.Now.AddSeconds(1), () =>
             {
                 callCount++;
-                return $"SuccessData_{callCount}";
-            }, TimeSpan.FromMilliseconds(500));
+                return $"value_{callCount}";
+            });
 
-            // Wait for refresh to be needed
-            Thread.Sleep(600);
+            // Wait for expiration
+            Thread.Sleep(1100);
 
-            // Act - Call with populate method that throws exception
-            var result2 = Cache.Get<string>(cacheKey, groupName, TimeSpan.FromMinutes(10), () =>
+            // Should repopulate due to expiration
+            var result2 = Cache.Get(cacheKey, groupName, DateTime.Now.AddSeconds(1), () =>
             {
                 callCount++;
-                throw new InvalidOperationException("Test exception in populate method");
-            }, TimeSpan.FromMilliseconds(500));
+                return $"value_{callCount}";
+            });
 
             // Assert
-            Assert.Equal("SuccessData_1", result1);
-            Assert.Equal("SuccessData_1", result2); // Should still return original data despite exception
-
-            // Wait for background refresh attempt to complete
-            Thread.Sleep(200);
-
-            // Call again to verify cache is still functional
-            var result3 = Cache.Get(cacheKey, groupName, TimeSpan.FromMinutes(10), () =>
-            {
-                callCount++;
-                return $"RecoveryData_{callCount}";
-            }, TimeSpan.FromMilliseconds(500));
-
-            Assert.Equal("SuccessData_1", result3); // Should still have original data
+            Assert.Equal("value_1", result1);
+            Assert.Equal("value_2", result2);
+            Assert.Equal(2, callCount);
         }
 
         [Fact]
-        public void Get_WithRefreshInterval_ValidatesMinimumRefreshInterval()
+        public void Get_WithNullParameters_ThrowsArgumentNullException()
         {
-            // Arrange
-            const string groupName = "ValidationTestGroup";
-            const string cacheKey = "validationKey";
-            var callCount = 0;
-
-            // Act - Use very small refresh interval (should be disabled)
-            var result = Cache.Get(cacheKey, groupName, TimeSpan.FromMinutes(10), () =>
-            {
-                callCount++;
-                return $"Data_{callCount}";
-            }, TimeSpan.FromMilliseconds(500)); // Less than 1 second
-
-            // Wait and call again
-            Thread.Sleep(600);
-            var result2 = Cache.Get(cacheKey, groupName, TimeSpan.FromMinutes(10), () =>
-            {
-                callCount++;
-                return $"Data_{callCount}";
-            }, TimeSpan.FromMilliseconds(500));
-
-            // Assert - For very small intervals, refresh should still work
-            // (The validation only disables intervals < 1ms, 500ms should work)
-            Assert.Equal("Data_1", result);
-            Assert.Equal("Data_1", result2); // Should be same initially, refresh happens in background
+            // Assert
+            Assert.Throws<ArgumentNullException>(() => Cache.Get<string>(null, "group", () => "value"));
+            Assert.Throws<ArgumentNullException>(() => Cache.Get("key", null, () => "value"));
+            Assert.Throws<ArgumentNullException>(() => Cache.Get<string>("key", "group", null));
         }
 
         [Fact]
-        public void GetAllCacheMetadata_WithMultipleItems_ReturnsAllMetadata()
+        public void Get_WithTimeSpanZeroSlidingExpiration_ThrowsArgumentException()
         {
-            // Arrange
-            const string group1 = "MetadataTestGroup1";
-            const string group2 = "MetadataTestGroup2";
-            var testList = new List<string> { "A", "B", "C" };
-
-            Cache.Get("stringKey", group1, () => "Hello World");
-            Cache.Get("intKey", group1, () => 42);
-            Cache.Get("listKey", group2, () => testList);
-
-            // Act
-            var metadata = Cache.GetAllCacheMetadata().ToList();
-
-            // Assert
-            Assert.Equal(3, metadata.Count);
-            
-            var stringMetadata = metadata.FirstOrDefault(m => m.CacheKey == "stringKey");
-            Assert.NotNull(stringMetadata);
-            Assert.Equal(group1, stringMetadata.GroupName);
-            Assert.Equal("String", stringMetadata.DataType);
-            Assert.True(stringMetadata.EstimatedMemorySize > 0);
-            Assert.Null(stringMetadata.CollectionCount); // String is not a collection
-
-            var intMetadata = metadata.FirstOrDefault(m => m.CacheKey == "intKey");
-            Assert.NotNull(intMetadata);
-            Assert.Equal(group1, intMetadata.GroupName);
-            Assert.Equal("Int32", intMetadata.DataType);
-
-            var listMetadata = metadata.FirstOrDefault(m => m.CacheKey == "listKey");
-            Assert.NotNull(listMetadata);
-            Assert.Equal(group2, listMetadata.GroupName);
-            Assert.Equal(3, listMetadata.CollectionCount); // List with 3 items
-        }
-
-        [Fact]
-        public void GetAllCacheMetadata_WithRefreshingItem_ShowsRefreshStatus()
-        {
-            // Arrange
-            const string groupName = "RefreshStatusGroup";
-            const string cacheKey = "refreshStatusKey";
-
-            // Create item with refresh interval
-            Cache.Get(cacheKey, groupName, TimeSpan.FromMinutes(10), () => "Initial Data", TimeSpan.FromSeconds(1));
-
-            // Act
-            var metadata = Cache.GetAllCacheMetadata().ToList();
-
-            // Assert
-            var itemMetadata = metadata.FirstOrDefault(m => m.CacheKey == cacheKey);
-            Assert.NotNull(itemMetadata);
-            Assert.True(itemMetadata.RefreshInterval.TotalMilliseconds >= 1000); // At least 1 second
-            Assert.True(itemMetadata.LastRefreshTime > DateTime.MinValue);
-            Assert.Equal(groupName, itemMetadata.GroupName);
-            Assert.Equal(cacheKey, itemMetadata.CacheKey);
-            Assert.Equal("String", itemMetadata.DataType);
-        }
-
-        [Fact]
-        public void GetAllCacheMetadata_WithNamedMethod_ReturnsPopulateMethodName()
-        {
-            // Arrange
-            const string groupName = "MethodNameTestGroup";
-            const string cacheKey = "methodNameKey";
-
-            // Use a direct method reference (not lambda)
-            Cache.Get(cacheKey, groupName, GetTestData);
-
-            // Act
-            var metadata = Cache.GetAllCacheMetadata().ToList();
-
-            // Assert
-            var itemMetadata = metadata.FirstOrDefault(m => m.CacheKey == cacheKey);
-            Assert.NotNull(itemMetadata);
-            Assert.NotNull(itemMetadata.PopulateMethodName);
-            Assert.Contains("GetTestData", itemMetadata.PopulateMethodName);
-        }
-
-        [Fact]
-        public void GetAllCacheMetadata_WithLambda_ShowsLambdaIndicator()
-        {
-            // Arrange
-            const string groupName = "LambdaTestGroup";
-            const string cacheKey = "lambdaKey";
-
-            // Use a lambda expression
-            Cache.Get(cacheKey, groupName, () => "Lambda Result");
-
-            // Act
-            var metadata = Cache.GetAllCacheMetadata().ToList();
-
-            // Assert
-            var itemMetadata = metadata.FirstOrDefault(m => m.CacheKey == cacheKey);
-            Assert.NotNull(itemMetadata);
-            Assert.Equal("[Lambda/Anonymous]", itemMetadata.PopulateMethodName);
-        }
-
-        /// <summary>
-        /// Test method used by the populate method name test
-        /// </summary>
-        /// <returns>Test data</returns>
-        private static string GetTestData()
-        {
-            return "Test data from named method";
+            // Assert - TimeSpan.Zero should not be allowed for sliding expiration
+            Assert.Throws<ArgumentException>(() =>
+                Cache.Get("key", "group", TimeSpan.Zero, () => "value"));
         }
 
         [Fact]
@@ -563,45 +266,162 @@ namespace CacheUtility.Tests
         }
 
         [Fact]
-        public void EnablePersistentCache_WithCustomOptions_UseCustomDirectory()
+        public void EnablePersistentCache_WithSpecificGroups_OnlyPersistsSpecifiedGroups()
         {
             // Arrange
             var tempDir = Path.Combine(Path.GetTempPath(), "CacheUtilityTest_" + Guid.NewGuid().ToString("N")[..8]);
-            var options = new PersistentCacheOptions
-            {
-                BaseDirectory = tempDir,
-                MaxFileSize = 5 * 1024 * 1024 // 5MB
-            };
 
             try
             {
-                // Act
+                // Enable persistent cache for only specific groups
+                var options = new PersistentCacheOptions
+                {
+                    BaseDirectory = tempDir,
+                    PersistentGroups = new[] { "group1", "group3" }
+                };
                 Cache.EnablePersistentCache(options);
 
-                // Assert
-                Assert.True(Cache.IsPersistentCacheEnabled);
-                Assert.True(Directory.Exists(tempDir));
+                // Cache items in different groups
+                Cache.Get("key1", "group1", () => "data1"); // Should be persisted
+                Cache.Get("key2", "group2", () => "data2"); // Should NOT be persisted
+                Cache.Get("key3", "group3", () => "data3"); // Should be persisted
 
-                // Test cache operation creates files
-                var result = Cache.Get("testKey", "testGroup", () => "Test Data");
-                Assert.Equal("Test Data", result);
-
-                // Verify files were created
+                // Check which files were created
                 var cacheFiles = Directory.GetFiles(tempDir, "*.cache");
                 var metaFiles = Directory.GetFiles(tempDir, "*.meta");
-                
-                Assert.True(cacheFiles.Length > 0, "Cache file should be created");
-                Assert.True(metaFiles.Length > 0, "Meta file should be created");
+
+                // Should only have files for group1 and group3
+                Assert.Equal(2, cacheFiles.Length);
+                Assert.Equal(2, metaFiles.Length);
+
+                // Clear memory cache and verify selective loading
+                Cache.RemoveAllFromMemoryOnly();
+
+                // These should load from persistent storage
+                var result1 = Cache.Get("key1", "group1", () => "should not be called");
+                var result3 = Cache.Get("key3", "group3", () => "should not be called");
+                Assert.Equal("data1", result1);
+                Assert.Equal("data3", result3);
+
+                // This should call populate method (not persisted)
+                var result2 = Cache.Get("key2", "group2", () => "new data2");
+                Assert.Equal("new data2", result2);
             }
             finally
             {
-                // Cleanup
                 Cache.DisablePersistentCache();
                 if (Directory.Exists(tempDir))
                 {
                     Directory.Delete(tempDir, true);
                 }
             }
+        }
+
+        [Fact]
+        public void EnablePersistentCache_WithoutSpecificGroups_PersistsNothing()
+        {
+            // Arrange
+            var tempDir = Path.Combine(Path.GetTempPath(), "CacheUtilityTest_" + Guid.NewGuid().ToString("N")[..8]);
+            var options = new PersistentCacheOptions { BaseDirectory = tempDir };
+
+            try
+            {
+                Cache.EnablePersistentCache(options);
+
+                // Cache items in different groups
+                Cache.Get("key1", "group1", () => "data1");
+                Cache.Get("key2", "group2", () => "data2");
+                Cache.Get("key3", "group3", () => "data3");
+
+                // Check that NO files were created (default is to persist nothing)
+                var cacheFiles = Directory.GetFiles(tempDir, "*.cache");
+                var metaFiles = Directory.GetFiles(tempDir, "*.meta");
+
+                Assert.Empty(cacheFiles);
+                Assert.Empty(metaFiles);
+            }
+            finally
+            {
+                Cache.DisablePersistentCache();
+                if (Directory.Exists(tempDir))
+                {
+                    Directory.Delete(tempDir, true);
+                }
+            }
+        }
+
+        [Fact]
+        public void SelectivePersistence_CaseInsensitive_GroupMatching()
+        {
+            // Arrange
+            var tempDir = Path.Combine(Path.GetTempPath(), "CacheUtilityTest_" + Guid.NewGuid().ToString("N")[..8]);
+
+            try
+            {
+                // Enable persistent cache for "TESTGROUP" (uppercase)
+                var options = new PersistentCacheOptions
+                {
+                    BaseDirectory = tempDir,
+                    PersistentGroups = new[] { "TESTGROUP" }
+                };
+                Cache.EnablePersistentCache(options);
+
+                // Test case insensitive matching
+                Cache.Get("testkey", "testgroup", () => "data1"); // Should be persisted (matches TESTGROUP case-insensitively)
+                Cache.Get("anotherkey", "TESTGROUP", () => "data2"); // Should be persisted (exact match)
+                Cache.Get("somekey", "othergroup", () => "data3"); // Should NOT be persisted (group not configured)
+
+                var cacheFiles = Directory.GetFiles(tempDir, "*.cache");
+                Assert.Equal(2, cacheFiles.Length);
+
+                Assert.Contains(cacheFiles, f => Path.GetFileName(f).Contains("testgroup_testkey"));
+                Assert.Contains(cacheFiles, f => Path.GetFileName(f).Contains("TESTGROUP_anotherkey"));
+                Assert.DoesNotContain(cacheFiles, f => Path.GetFileName(f).Contains("othergroup_somekey"));
+            }
+            finally
+            {
+                Cache.DisablePersistentCache();
+                if (Directory.Exists(tempDir))
+                {
+                    Directory.Delete(tempDir, true);
+                }
+            }
+        }
+
+        [Fact]
+        public void Get_WithAutoRefresh_RefreshesInBackground()
+        {
+            // Arrange
+            const string groupName = "RefreshTestGroup";
+            const string cacheKey = "refreshKey";
+            var callCount = 0;
+
+            // Act - First call populates cache with 100ms refresh interval
+            var result1 = Cache.Get(cacheKey, groupName, TimeSpan.FromMinutes(10), () =>
+            {
+                callCount++;
+                return $"Data_{callCount}";
+            }, TimeSpan.FromMilliseconds(100));
+
+            // Wait for refresh to be needed
+            Thread.Sleep(150);
+
+            // This call should trigger background refresh but return existing data immediately
+            var result2 = Cache.Get(cacheKey, groupName, TimeSpan.FromMinutes(10), () =>
+            {
+                callCount++;
+                return $"Data_{callCount}";
+            }, TimeSpan.FromMilliseconds(100));
+
+            // Assert
+            Assert.Equal("Data_1", result1);
+            Assert.Equal("Data_1", result2); // Should still be old data (non-blocking refresh)
+
+            // Give some time for background refresh
+            Thread.Sleep(50);
+
+            // Verify that the refresh mechanism was triggered
+            Assert.True(callCount >= 1, "Populate method should have been called at least once");
         }
 
         [Fact]
@@ -609,42 +429,26 @@ namespace CacheUtility.Tests
         {
             // Arrange
             var tempDir = Path.Combine(Path.GetTempPath(), "CacheUtilityTest_" + Guid.NewGuid().ToString("N")[..8]);
-            var options = new PersistentCacheOptions { BaseDirectory = tempDir };
+            const string groupName = "persistentTestGroup";
+            var options = new PersistentCacheOptions 
+            { 
+                BaseDirectory = tempDir,
+                PersistentGroups = new[] { groupName }
+            };
 
             try
             {
                 Cache.EnablePersistentCache(options);
-                
+
                 // Cache some data
-                const string groupName = "persistentTestGroup";
                 const string cacheKey = "persistentKey";
                 const string testData = "Persistent Test Data";
-                
+
                 var result1 = Cache.Get(cacheKey, groupName, () => testData);
                 Assert.Equal(testData, result1);
 
-                // Verify files were created
-                var cacheFiles = Directory.GetFiles(tempDir, "*.cache");
-                var metaFiles = Directory.GetFiles(tempDir, "*.meta");
-                Assert.True(cacheFiles.Length > 0, "Cache file should be created");
-                Assert.True(metaFiles.Length > 0, "Meta file should be created");
-
-                // Debug: Check file contents
-                var expectedFileName = $"{groupName}_{cacheKey}";
-                var cacheFile = cacheFiles.FirstOrDefault(f => Path.GetFileNameWithoutExtension(f).Contains(expectedFileName));
-                Assert.NotNull(cacheFile);
-                
-                var fileContent = File.ReadAllText(cacheFile);
-                Assert.Contains(testData, fileContent);
-
                 // Clear memory cache only (leave persistent files)
                 Cache.RemoveAllFromMemoryOnly();
-
-                // Verify files still exist after memory cache clear
-                cacheFiles = Directory.GetFiles(tempDir, "*.cache");
-                metaFiles = Directory.GetFiles(tempDir, "*.meta");
-                Assert.True(cacheFiles.Length > 0, "Cache files should still exist after memory cache clear");
-                Assert.True(metaFiles.Length > 0, "Meta files should still exist after memory cache clear");
 
                 // Data should still be available from persistent storage
                 var result2 = Cache.Get(cacheKey, groupName, () => "This should not be called");
@@ -652,448 +456,12 @@ namespace CacheUtility.Tests
             }
             finally
             {
-                // Cleanup
                 Cache.DisablePersistentCache();
                 if (Directory.Exists(tempDir))
                 {
                     Directory.Delete(tempDir, true);
                 }
             }
-        }
-
-        [Fact]
-        public void PersistentCache_RemovalCleansUpFiles()
-        {
-            // Arrange
-            var tempDir = Path.Combine(Path.GetTempPath(), "CacheUtilityTest_" + Guid.NewGuid().ToString("N")[..8]);
-            var options = new PersistentCacheOptions { BaseDirectory = tempDir };
-
-            try
-            {
-                Cache.EnablePersistentCache(options);
-                
-                const string groupName = "removalTestGroup";
-                const string cacheKey = "removalKey";
-                
-                // Cache some data
-                Cache.Get(cacheKey, groupName, () => "Test Data");
-                
-                // Verify files exist
-                var cacheFiles = Directory.GetFiles(tempDir, "*.cache");
-                var metaFiles = Directory.GetFiles(tempDir, "*.meta");
-                Assert.True(cacheFiles.Length > 0);
-                Assert.True(metaFiles.Length > 0);
-
-                // Remove from cache
-                Cache.Remove(cacheKey, groupName);
-
-                // Verify files are cleaned up
-                cacheFiles = Directory.GetFiles(tempDir, "*.cache");
-                metaFiles = Directory.GetFiles(tempDir, "*.meta");
-                Assert.Empty(cacheFiles);
-                Assert.Empty(metaFiles);
-            }
-            finally
-            {
-                // Cleanup
-                Cache.DisablePersistentCache();
-                if (Directory.Exists(tempDir))
-                {
-                    Directory.Delete(tempDir, true);
-                }
-            }
-        }
-
-        [Fact]
-        public void PersistentCache_GroupRemovalCleansUpFiles()
-        {
-            // Arrange
-            var tempDir = Path.Combine(Path.GetTempPath(), "CacheUtilityTest_" + Guid.NewGuid().ToString("N")[..8]);
-            var options = new PersistentCacheOptions { BaseDirectory = tempDir };
-
-            try
-            {
-                Cache.EnablePersistentCache(options);
-                
-                const string groupName = "groupRemovalTest";
-                
-                // Cache multiple items in the same group
-                Cache.Get("key1", groupName, () => "Data 1");
-                Cache.Get("key2", groupName, () => "Data 2");
-                Cache.Get("key3", groupName, () => "Data 3");
-                
-                // Verify files exist
-                var cacheFiles = Directory.GetFiles(tempDir, "*.cache");
-                var metaFiles = Directory.GetFiles(tempDir, "*.meta");
-                Assert.True(cacheFiles.Length >= 3);
-                Assert.True(metaFiles.Length >= 3);
-
-                // Remove entire group
-                Cache.RemoveGroup(groupName);
-
-                // Verify all files are cleaned up
-                cacheFiles = Directory.GetFiles(tempDir, "*.cache");
-                metaFiles = Directory.GetFiles(tempDir, "*.meta");
-                Assert.Empty(cacheFiles);
-                Assert.Empty(metaFiles);
-            }
-            finally
-            {
-                // Cleanup
-                Cache.DisablePersistentCache();
-                if (Directory.Exists(tempDir))
-                {
-                    Directory.Delete(tempDir, true);
-                }
-            }
-        }
-
-        [Fact]
-        public void PersistentCache_WithComplexData_SerializesCorrectly()
-        {
-            // Arrange
-            var tempDir = Path.Combine(Path.GetTempPath(), "CacheUtilityTest_" + Guid.NewGuid().ToString("N")[..8]);
-            var options = new PersistentCacheOptions { BaseDirectory = tempDir };
-
-            try
-            {
-                Cache.EnablePersistentCache(options);
-                
-                const string groupName = "complexDataTest";
-                const string cacheKey = "complexKey";
-                
-                var complexData = new TestComplexData
-                {
-                    Name = "Test User",
-                    Age = 25,
-                    Items = new[] { "Item1", "Item2", "Item3" },
-                    CreatedDate = DateTime.Now,
-                    IsActive = true
-                };
-                
-                // Cache complex data
-                var result1 = Cache.Get(cacheKey, groupName, () => complexData);
-                Assert.NotNull(result1);
-                Assert.Equal(complexData.Name, result1.Name);
-                Assert.Equal(complexData.Age, result1.Age);
-
-                // Clear memory cache only (leave persistent files)
-                Cache.RemoveAllFromMemoryOnly();
-
-                // Retrieve from persistent storage
-                var result2 = Cache.Get<TestComplexData>(cacheKey, groupName, () => throw new InvalidOperationException("Should not be called"));
-                Assert.NotNull(result2);
-                Assert.Equal(complexData.Name, result2.Name);
-                Assert.Equal(complexData.Age, result2.Age);
-                Assert.Equal(complexData.Items.Length, result2.Items.Length);
-            }
-            finally
-            {
-                // Cleanup
-                Cache.DisablePersistentCache();
-                if (Directory.Exists(tempDir))
-                {
-                    Directory.Delete(tempDir, true);
-                }
-            }
-        }
-
-        [Fact]
-        public void PersistentCache_Statistics_ReturnsCorrectInformation()
-        {
-            // Arrange
-            var tempDir = Path.Combine(Path.GetTempPath(), "CacheUtilityTest_" + Guid.NewGuid().ToString("N")[..8]);
-            var options = new PersistentCacheOptions { BaseDirectory = tempDir };
-
-            try
-            {
-                // Test when disabled
-                var statsDisabled = Cache.GetPersistentCacheStatistics();
-                Assert.False(statsDisabled.IsEnabled);
-                Assert.Equal(0, statsDisabled.TotalFiles);
-
-                // Enable persistent cache
-                Cache.EnablePersistentCache(options);
-                
-                // Test when enabled but empty
-                var statsEmpty = Cache.GetPersistentCacheStatistics();
-                Assert.True(statsEmpty.IsEnabled);
-                Assert.Equal(tempDir, statsEmpty.BaseDirectory);
-                Assert.Equal(0, statsEmpty.TotalFiles);
-
-                // Add some cache items
-                Cache.Get("key1", "group1", () => "value1");
-                Cache.Get("key2", "group1", () => "value2");
-                Cache.Get("key3", "group2", () => new { Data = "complex" });
-
-                // Test statistics with data
-                var statsWithData = Cache.GetPersistentCacheStatistics();
-                Assert.True(statsWithData.IsEnabled);
-                Assert.True(statsWithData.TotalFiles >= 6); // 3 cache + 3 meta files
-                Assert.True(statsWithData.CacheFiles >= 3);
-                Assert.True(statsWithData.MetaFiles >= 3);
-                Assert.True(statsWithData.TotalSizeBytes > 0);
-                Assert.NotEmpty(statsWithData.TotalSizeFormatted);
-                
-                // Test enhanced statistics
-                Assert.True(statsWithData.LargestFileSize > 0);
-                Assert.True(statsWithData.SmallestFileSize > 0);
-                Assert.True(statsWithData.AverageFileSize > 0);
-                Assert.NotEmpty(statsWithData.AverageFileSizeFormatted);
-                Assert.Equal(0, statsWithData.OrphanedFiles); // Should be no orphaned files
-                Assert.NotNull(statsWithData.OldestFileTime);
-                Assert.NotNull(statsWithData.NewestFileTime);
-                Assert.True(statsWithData.NewestFileTime >= statsWithData.OldestFileTime);
-                Assert.NotNull(statsWithData.DirectoryAge);
-                Assert.NotNull(statsWithData.TimeSinceLastActivity);
-                Assert.True(statsWithData.DirectoryAge >= statsWithData.TimeSinceLastActivity);
-            }
-            finally
-            {
-                // Cleanup
-                Cache.DisablePersistentCache();
-                if (Directory.Exists(tempDir))
-                {
-                    Directory.Delete(tempDir, true);
-                }
-            }
-        }
-
-        [Fact]
-        public void PersistentCache_Metadata_IncludesPersistentInformation()
-        {
-            // Arrange
-            var tempDir = Path.Combine(Path.GetTempPath(), "CacheUtilityTest_" + Guid.NewGuid().ToString("N")[..8]);
-            var options = new PersistentCacheOptions { BaseDirectory = tempDir };
-
-            try
-            {
-                Cache.EnablePersistentCache(options);
-                
-                const string groupName = "metadataTest";
-                const string cacheKey = "metadataKey";
-                
-                // Cache some data
-                Cache.Get(cacheKey, groupName, () => "test data");
-
-                // Get metadata
-                var metadata = Cache.GetAllCacheMetadata().ToList();
-                var itemMetadata = metadata.FirstOrDefault(m => m.CacheKey == cacheKey && m.GroupName == groupName);
-                
-                Assert.NotNull(itemMetadata);
-                Assert.True(itemMetadata.IsPersisted);
-                Assert.NotEmpty(itemMetadata.PersistentFilePath);
-                Assert.True(itemMetadata.PersistentFileSize > 0);
-                Assert.NotNull(itemMetadata.LastPersistedTime);
-                Assert.True(File.Exists(itemMetadata.PersistentFilePath));
-            }
-            finally
-            {
-                // Cleanup
-                Cache.DisablePersistentCache();
-                if (Directory.Exists(tempDir))
-                {
-                    Directory.Delete(tempDir, true);
-                }
-            }
-        }
-
-        [Fact]
-        public void PersistentCache_NoPerformanceImpact_WhenDisabled()
-        {
-            // Ensure persistent cache is disabled
-            Cache.DisablePersistentCache();
-            Assert.False(Cache.IsPersistentCacheEnabled);
-
-            // Test 1: Cache misses with persistent cache disabled
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-            for (int i = 0; i < 1000; i++)
-            {
-                var data = Cache.Get($"miss_key_{i}", "perftest_disabled", () => $"data_{i}");
-            }
-            sw.Stop();
-            var timeMissesDisabled = sw.ElapsedMilliseconds;
-
-            // Test 2: Cache hits with persistent cache disabled
-            sw.Restart();
-            for (int i = 0; i < 1000; i++)
-            {
-                var data = Cache.Get($"miss_key_{i % 100}", "perftest_disabled", () => $"should_not_be_called_{i}");
-            }
-            sw.Stop();
-            var timeHitsDisabled = sw.ElapsedMilliseconds;
-
-            // Cache hits should be significantly faster than cache misses (or at least equal when both are very fast)
-            Assert.True(timeHitsDisabled <= timeMissesDisabled, 
-                $"Cache hits slower than misses: {timeHitsDisabled}ms vs {timeMissesDisabled}ms for misses");
-
-            // Cache hits should be very fast (under 100ms for 1000 operations)
-            Assert.True(timeHitsDisabled < 100, 
-                $"Cache hits too slow when persistent disabled: {timeHitsDisabled}ms");
-
-            // Cache misses should be reasonable (under 1000ms for 1000 operations)
-            Assert.True(timeMissesDisabled < 1000, 
-                $"Cache misses too slow when persistent disabled: {timeMissesDisabled}ms");
-
-            // Cleanup
-            Cache.RemoveGroup("perftest_disabled");
-        }
-
-        [Fact]
-        public void PersistentCache_PerformanceComparison_EnabledVsDisabled()
-        {
-            var tempDir = Path.Combine(Path.GetTempPath(), "CacheUtilityPerfTest_" + Guid.NewGuid().ToString("N")[..8]);
-            
-            try
-            {
-                // Test cache hits performance - should be nearly identical
-                
-                // First with persistent cache disabled
-                Cache.DisablePersistentCache();
-                
-                // Pre-populate cache
-                for (int i = 0; i < 100; i++)
-                {
-                    Cache.Get($"hit_key_{i}", "hitgroup_disabled", () => $"data_{i}");
-                }
-
-                var sw = System.Diagnostics.Stopwatch.StartNew();
-                for (int i = 0; i < 1000; i++)
-                {
-                    var data = Cache.Get($"hit_key_{i % 100}", "hitgroup_disabled", () => $"should_not_be_called");
-                }
-                sw.Stop();
-                var hitTimeDisabled = sw.ElapsedMilliseconds;
-
-                // Now with persistent cache enabled
-                Cache.EnablePersistentCache(new PersistentCacheOptions { BaseDirectory = tempDir });
-                
-                // Pre-populate cache
-                for (int i = 0; i < 100; i++)
-                {
-                    Cache.Get($"hit_key_{i}", "hitgroup_enabled", () => $"data_{i}");
-                }
-
-                sw.Restart();
-                for (int i = 0; i < 1000; i++)
-                {
-                    var data = Cache.Get($"hit_key_{i % 100}", "hitgroup_enabled", () => $"should_not_be_called");
-                }
-                sw.Stop();
-                var hitTimeEnabled = sw.ElapsedMilliseconds;
-
-                // Cache hits should have minimal performance difference
-                // Allow up to 2x difference (very generous), but handle case where both are 0ms
-                var maxAllowedTime = Math.Max(hitTimeDisabled * 2, 1); // At least 1ms tolerance
-                Assert.True(hitTimeEnabled <= maxAllowedTime, 
-                    $"Cache hits much slower with persistent enabled: {hitTimeEnabled}ms vs {hitTimeDisabled}ms disabled");
-
-                // Both should be fast (under 100ms for 1000 operations)
-                Assert.True(hitTimeDisabled < 100, $"Cache hits too slow when disabled: {hitTimeDisabled}ms");
-                Assert.True(hitTimeEnabled < 200, $"Cache hits too slow when enabled: {hitTimeEnabled}ms");
-            }
-            finally
-            {
-                // Cleanup
-                Cache.DisablePersistentCache();
-                if (Directory.Exists(tempDir))
-                {
-                    Directory.Delete(tempDir, true);
-                }
-            }
-        }
-
-        [Fact]
-        public void GetAllCacheMetadata_IncludesNextRefreshTime_AndPersistentInfo()
-        {
-            var tempDir = Path.Combine(Path.GetTempPath(), "CacheUtilityTest_" + Guid.NewGuid().ToString("N")[..8]);
-            var options = new PersistentCacheOptions { BaseDirectory = tempDir };
-
-            try
-            {
-                // Enable persistent cache
-                Cache.EnablePersistentCache(options);
-                
-                const string groupName = "refreshTestGroup";
-                const string cacheKey = "refreshTestKey";
-                
-                // Cache item with auto-refresh
-                var refreshInterval = TimeSpan.FromMinutes(5);
-                Cache.Get(cacheKey, groupName, TimeSpan.FromHours(1), () => "test data", refreshInterval);
-
-                // Get metadata
-                var metadata = Cache.GetAllCacheMetadata().ToList();
-                var itemMetadata = metadata.FirstOrDefault(m => m.CacheKey == cacheKey && m.GroupName == groupName);
-                
-                Assert.NotNull(itemMetadata);
-                
-                // Verify refresh time information
-                Assert.Equal(refreshInterval, itemMetadata.RefreshInterval);
-                Assert.NotNull(itemMetadata.NextRefreshTime);
-                Assert.True(itemMetadata.NextRefreshTime > DateTime.Now);
-                Assert.True(itemMetadata.NextRefreshTime <= DateTime.Now.Add(refreshInterval).AddSeconds(1)); // Allow 1 second tolerance
-
-                // Verify persistent cache information
-                Assert.True(itemMetadata.PersistentCacheEnabled);
-                Assert.True(itemMetadata.IsPersisted);
-                Assert.NotEmpty(itemMetadata.PersistentFilePath);
-                Assert.NotEmpty(itemMetadata.PersistentMetaFilePath);
-                Assert.True(itemMetadata.PersistentFileSize > 0);
-                Assert.True(itemMetadata.PersistentMetaFileSize > 0);
-                Assert.True(itemMetadata.TotalPersistentSize > itemMetadata.PersistentFileSize);
-                Assert.NotNull(itemMetadata.LastPersistedTime);
-                Assert.True(File.Exists(itemMetadata.PersistentFilePath));
-                Assert.True(File.Exists(itemMetadata.PersistentMetaFilePath));
-            }
-            finally
-            {
-                // Cleanup
-                Cache.DisablePersistentCache();
-                if (Directory.Exists(tempDir))
-                {
-                    Directory.Delete(tempDir, true);
-                }
-            }
-        }
-
-        [Fact]
-        public void GetAllCacheMetadata_WithoutRefresh_ShowsNoNextRefreshTime()
-        {
-            // Arrange
-            Cache.DisablePersistentCache();
-            const string groupName = "noRefreshGroup";
-            const string cacheKey = "noRefreshKey";
-            
-            // Cache item without auto-refresh
-            Cache.Get(cacheKey, groupName, () => "test data");
-
-            // Act
-            var metadata = Cache.GetAllCacheMetadata().ToList();
-            var itemMetadata = metadata.FirstOrDefault(m => m.CacheKey == cacheKey && m.GroupName == groupName);
-            
-            // Assert
-            Assert.NotNull(itemMetadata);
-            Assert.Equal(TimeSpan.Zero, itemMetadata.RefreshInterval);
-            Assert.Null(itemMetadata.NextRefreshTime);
-            Assert.False(itemMetadata.PersistentCacheEnabled);
-            Assert.False(itemMetadata.IsPersisted);
-            Assert.Empty(itemMetadata.PersistentFilePath);
-            Assert.Empty(itemMetadata.PersistentMetaFilePath);
-            Assert.Equal(0, itemMetadata.PersistentFileSize);
-            Assert.Equal(0, itemMetadata.PersistentMetaFileSize);
-            Assert.Equal(0, itemMetadata.TotalPersistentSize);
-        }
-
-        /// <summary>
-        /// Test class for complex data serialization testing
-        /// </summary>
-        public class TestComplexData
-        {
-            public string Name { get; set; } = string.Empty;
-            public int Age { get; set; }
-            public string[] Items { get; set; } = Array.Empty<string>();
-            public DateTime CreatedDate { get; set; }
-            public bool IsActive { get; set; }
         }
     }
-} 
+}

@@ -5,10 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2024-12-19
+
+### Changed
+- **Improved Selective Persistence**: Consolidated API design by adding `PersistentGroups` string array property to `PersistentCacheOptions`
+- **Enhanced Validation**: Added `TimeSpan.Zero` validation for sliding expiration to prevent problematic cache configurations
+
+### Improved  
+- **API Consistency**: Single `EnablePersistentCache(PersistentCacheOptions)` method with all configuration consolidated in options class
+- **Code Quality**: Cleaner internal architecture with better separation of concerns
+
+### Fixed
+- Improved error messages for invalid TimeSpan parameters
+
 ## [1.1.0] - 2024-12-19
 
 ### Added
-- **Persistent Cache Storage**: Data now survives application restarts
+- **Persistent Cache Storage**: Data can now survives application restarts
   - JSON-based serialization for cross-platform compatibility
   - Configurable base directory (defaults to `%LOCALAPPDATA%/CacheUtility/`)
   - Automatic file cleanup when cache items expire or are removed
@@ -32,12 +45,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Troubleshooting guide for common scenarios
 
 ### Changed
-- Enhanced `GetAllCacheMetadata()` with additional properties
 - Improved error handling throughout the codebase
 - Updated NuGet package metadata and tags
-
-### Removed
-- `RemovalCallbackName` property (was always null due to MemoryCache limitations)
 
 ### Technical Details
 - Added automatic background cleanup timer for expired persistent files

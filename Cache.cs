@@ -71,9 +71,7 @@ namespace CacheUtility
         /// <returns>Cached or newly created object</returns>
         public static TData Get<TData>(string cacheKey, string groupName, TimeSpan slidingExpiration, Func<TData> populateMethod, TimeSpan refresh = default)
         {
-            if (string.IsNullOrEmpty(cacheKey)) throw new ArgumentNullException(nameof(cacheKey));
-            if (string.IsNullOrEmpty(groupName)) throw new ArgumentNullException(nameof(groupName));
-            if (populateMethod == null) throw new ArgumentNullException(nameof(populateMethod));
+            if (slidingExpiration == TimeSpan.Zero) throw new ArgumentException("TimeSpan.Zero is not allowed for sliding expiration", nameof(slidingExpiration));
             return Get(cacheKey, groupName, DateTime.MaxValue, slidingExpiration, CacheItemPriority.Default, populateMethod, null, refresh);
         }
 
@@ -195,7 +193,7 @@ namespace CacheUtility
             {
                 // Get the cache item to dispose any timers
                 var cacheItem = MemoryCache.Default.Get(cacheKey);
-                if (cacheItem != null && cacheItem.GetType().IsGenericType && 
+                if (cacheItem != null && cacheItem.GetType().IsGenericType &&
                     cacheItem.GetType().GetGenericTypeDefinition() == typeof(CacheItem<>))
                 {
                     // Use reflection to call Dispose method
@@ -266,7 +264,7 @@ namespace CacheUtility
                 {
                     // Get the cache item to dispose any timers
                     var cacheItem = MemoryCache.Default.Get(key);
-                    if (cacheItem != null && cacheItem.GetType().IsGenericType && 
+                    if (cacheItem != null && cacheItem.GetType().IsGenericType &&
                         cacheItem.GetType().GetGenericTypeDefinition() == typeof(CacheItem<>))
                     {
                         // Use reflection to call Dispose method
@@ -362,12 +360,14 @@ namespace CacheUtility
         }
 
         /// <summary>
-        /// Enable persistent cache with default options
+        /// Enable persistent cache with default options (persists all cache groups)
         /// </summary>
         public static void EnablePersistentCache()
         {
             EnablePersistentCache(new PersistentCacheOptions());
         }
+
+
 
         /// <summary>
         /// Enable persistent cache with custom options
@@ -379,6 +379,8 @@ namespace CacheUtility
 
             lock (CacheLock)
             {
+                // Ensure the internal HashSet is updated before setting options
+                options.UpdatePersistentGroupsSet();
                 _persistentOptions = options;
 
                 // Ensure cache directory exists
@@ -390,7 +392,7 @@ namespace CacheUtility
                 // Start cleanup timer if not already running
                 if (_persistentCleanupTimer == null)
                 {
-                    _persistentCleanupTimer = new Timer(CleanupExpiredPersistentFiles, null, 
+                    _persistentCleanupTimer = new Timer(CleanupExpiredPersistentFiles, null,
                         TimeSpan.FromMinutes(5), TimeSpan.FromMinutes(30));
                 }
             }
@@ -404,7 +406,7 @@ namespace CacheUtility
             lock (CacheLock)
             {
                 _persistentOptions = null;
-                
+
                 // Stop cleanup timer
                 _persistentCleanupTimer?.Dispose();
                 _persistentCleanupTimer = null;
@@ -415,6 +417,21 @@ namespace CacheUtility
         /// Check if persistent cache is enabled
         /// </summary>
         public static bool IsPersistentCacheEnabled => _persistentOptions != null;
+
+        /// <summary>
+        /// Determines whether a specific cache item should be persisted based on configuration
+        /// </summary>
+        /// <param name="groupName">Cache group name</param>
+        /// <param name="cacheKey">Cache key (without group prefix)</param>
+        /// <returns>True if the item should be persisted, false otherwise</returns>
+        private static bool ShouldPersistItem(string groupName, string cacheKey)
+        {
+            if (_persistentOptions == null) return false;
+            if (_persistentOptions._persistentGroupsSet == null) return false;
+
+            // Only persist groups that are explicitly configured
+            return _persistentOptions._persistentGroupsSet.Contains(groupName);
+        }
 
         /// <summary>
         /// Get persistent cache configuration options
@@ -476,13 +493,13 @@ namespace CacheUtility
                 var cacheFiles = Directory.GetFiles(_persistentOptions.BaseDirectory, "*.cache");
                 var metaFiles = Directory.GetFiles(_persistentOptions.BaseDirectory, "*.meta");
                 var allFiles = cacheFiles.Concat(metaFiles).ToArray();
-                
+
                 long totalSize = 0;
                 long largestSize = 0;
                 long smallestSize = long.MaxValue;
                 DateTime? oldestTime = null;
                 DateTime? newestTime = null;
-                
+
                 foreach (var file in allFiles)
                 {
                     try
@@ -490,11 +507,11 @@ namespace CacheUtility
                         var fileInfo = new FileInfo(file);
                         var size = fileInfo.Length;
                         var lastWrite = fileInfo.LastWriteTime;
-                        
+
                         totalSize += size;
                         largestSize = Math.Max(largestSize, size);
                         smallestSize = Math.Min(smallestSize, size);
-                        
+
                         if (!oldestTime.HasValue || lastWrite < oldestTime.Value)
                             oldestTime = lastWrite;
                         if (!newestTime.HasValue || lastWrite > newestTime.Value)
@@ -726,8 +743,8 @@ namespace CacheUtility
             {
                 cacheItem.Item = newValue;
                 cacheItem.LastRefreshTime = DateTime.Now;
-                
-                // Update persistent cache if enabled
+
+                // Update persistent cache if enabled and item should be persisted
                 var fullCacheKey = $"{cacheItem.GroupName}_{cacheItem.CacheKey}";
                 SaveToPersistentCache(fullCacheKey, cacheItem, DateTime.MaxValue, TimeSpan.Zero);
             }
@@ -746,7 +763,7 @@ namespace CacheUtility
             {
                 // Dispose the cache item (which will dispose the timer)
                 cacheItem?.Dispose();
-                
+
                 // Call user callback if provided
                 userCallback?.Invoke(args);
             };
@@ -833,6 +850,12 @@ namespace CacheUtility
         {
             if (_persistentOptions == null) return null;
 
+            // Check if this item should be persisted (if not, don't try to load it)
+            if (!ShouldPersistItem(groupName, originalCacheKey))
+            {
+                return null; // This item shouldn't be persisted, so don't try to load it
+            }
+
             try
             {
                 var cacheFilePath = GetPersistentCacheFilePath(cacheKey);
@@ -893,6 +916,12 @@ namespace CacheUtility
         private static void SaveToPersistentCache<TData>(string cacheKey, CacheItem<TData> cacheItem, DateTime absoluteExpiration, TimeSpan slidingExpiration)
         {
             if (_persistentOptions == null) return;
+
+            // Check if this specific item should be persisted
+            if (!ShouldPersistItem(cacheItem.GroupName, cacheItem.CacheKey))
+            {
+                return; // Skip persistence for this item
+            }
 
             try
             {
@@ -1041,12 +1070,12 @@ namespace CacheUtility
         {
             var invalidChars = Path.GetInvalidFileNameChars();
             var safeFileName = cacheKey;
-            
+
             foreach (var c in invalidChars)
             {
                 safeFileName = safeFileName.Replace(c, '_');
             }
-            
+
             return safeFileName;
         }
 
@@ -1063,7 +1092,7 @@ namespace CacheUtility
                 if (!Directory.Exists(_persistentOptions.BaseDirectory)) return;
 
                 var metaFiles = Directory.GetFiles(_persistentOptions.BaseDirectory, "*.meta");
-                
+
                 foreach (var metaFile in metaFiles)
                 {
                     try
@@ -1075,7 +1104,7 @@ namespace CacheUtility
                         {
                             // Remove both meta and cache files
                             var cacheFile = Path.ChangeExtension(metaFile, ".cache");
-                            
+
                             File.Delete(metaFile);
                             if (File.Exists(cacheFile))
                             {
@@ -1194,28 +1223,28 @@ namespace CacheUtility
             /// <summary>
             /// The populate method used to refresh this cache item
             /// </summary>
-            public Func<T> PopulateMethod 
-            { 
-                get => _populateMethod; 
-                set => _populateMethod = value; 
+            public Func<T> PopulateMethod
+            {
+                get => _populateMethod;
+                set => _populateMethod = value;
             }
 
             /// <summary>
             /// Timer for automatic refresh
             /// </summary>
-            public Timer RefreshTimer 
-            { 
-                get => _refreshTimer; 
-                set => _refreshTimer = value; 
+            public Timer RefreshTimer
+            {
+                get => _refreshTimer;
+                set => _refreshTimer = value;
             }
 
             /// <summary>
             /// Current refresh task
             /// </summary>
-            public Task RefreshTask 
-            { 
-                get => _refreshTask; 
-                set => _refreshTask = value; 
+            public Task RefreshTask
+            {
+                get => _refreshTask;
+                set => _refreshTask = value;
             }
 
             /// <summary>
@@ -1244,7 +1273,7 @@ namespace CacheUtility
                 lockSlim.Dispose();
             }
             RegisteredKeys.Clear();
-            
+
             // Clean up persistent cache timer
             _persistentCleanupTimer?.Dispose();
             _persistentCleanupTimer = null;
@@ -1364,7 +1393,7 @@ namespace CacheUtility
 
                     var lastRefreshTime = (DateTime)(lastRefreshTimeProperty?.GetValue(cachedItem) ?? DateTime.MinValue);
                     var refreshInterval = (TimeSpan)(refreshIntervalProperty?.GetValue(cachedItem) ?? TimeSpan.Zero);
-                    
+
                     var metadata = new CacheItemMetadata
                     {
                         CacheKey = originalKey,
@@ -1407,7 +1436,7 @@ namespace CacheUtility
 
                     // Add persistent cache information
                     PopulatePersistentCacheMetadata(metadata, fullCacheKey);
-                    
+
                     return metadata;
                 }
             }
@@ -1501,12 +1530,12 @@ namespace CacheUtility
                 var metaFilePath = GetPersistentCacheMetaFilePath(fullCacheKey);
 
                 metadata.IsPersisted = File.Exists(cacheFilePath) && File.Exists(metaFilePath);
-                
+
                 if (metadata.IsPersisted)
                 {
                     metadata.PersistentFilePath = cacheFilePath;
                     metadata.PersistentMetaFilePath = metaFilePath;
-                    
+
                     try
                     {
                         var cacheFileInfo = new FileInfo(cacheFilePath);
@@ -1561,9 +1590,9 @@ namespace CacheUtility
                 if (method.Method != null)
                 {
                     var methodInfo = method.Method;
-                    
+
                     // Skip compiler-generated methods (lambdas, anonymous methods)
-                    if (methodInfo.Name.Contains("<") || methodInfo.Name.Contains("lambda") || 
+                    if (methodInfo.Name.Contains("<") || methodInfo.Name.Contains("lambda") ||
                         methodInfo.Name.Contains("Anonymous") || methodInfo.DeclaringType?.Name.Contains("<>") == true)
                     {
                         return "[Lambda/Anonymous]";
@@ -1716,12 +1745,52 @@ namespace CacheUtility
         public long MaxFileSize { get; set; }
 
         /// <summary>
+        /// Array of cache group names that should be persisted to disk.
+        /// If null or empty, no cache groups will be persisted.
+        /// If specified, only cache groups in this array will be persisted.
+        /// </summary>
+        public string[] PersistentGroups { get; set; }
+
+        /// <summary>
+        /// Internal HashSet for efficient lookup of persistent groups (case-insensitive).
+        /// Automatically populated from PersistentGroups array.
+        /// </summary>
+        internal HashSet<string> _persistentGroupsSet { get; private set; }
+
+        /// <summary>
         /// Default constructor with sensible defaults
         /// </summary>
         public PersistentCacheOptions()
         {
             BaseDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CacheUtility");
             MaxFileSize = 10 * 1024 * 1024; // 10MB default limit
+            PersistentGroups = new string[0]; // empty array means persist nothing by default
+            UpdatePersistentGroupsSet();
+        }
+
+        /// <summary>
+        /// Updates the internal HashSet when PersistentGroups changes
+        /// </summary>
+        public void UpdatePersistentGroupsSet()
+        {
+            if (PersistentGroups == null || PersistentGroups.Length == 0)
+            {
+                _persistentGroupsSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase); // empty set means persist nothing
+            }
+            else
+            {
+                _persistentGroupsSet = new HashSet<string>(PersistentGroups, StringComparer.OrdinalIgnoreCase);
+            }
+        }
+
+        /// <summary>
+        /// Sets the persistent groups and updates the internal HashSet
+        /// </summary>
+        /// <param name="groups">Array of group names to persist</param>
+        public void SetPersistentGroups(params string[] groups)
+        {
+            PersistentGroups = groups;
+            UpdatePersistentGroupsSet();
         }
     }
 
