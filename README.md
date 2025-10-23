@@ -36,7 +36,7 @@ dotnet add package CacheUtility
 
 ### PackageReference
 ```xml
-<PackageReference Include="CacheUtility" Version="1.1.0" />
+<PackageReference Include="CacheUtility" Version="1.2.1" />
 ```
 
 ## Quick Start
@@ -223,8 +223,8 @@ Persistent cache files are stored with a simple naming pattern:
 %LOCALAPPDATA%/CacheUtility/
 ├── users_userProfile_123.cache     # Cache data
 ├── users_userProfile_123.meta      # Expiration metadata
-├── reports_monthly_2024.cache
-├── reports_monthly_2024.meta
+├── reports_monthly_2025.cache
+├── reports_monthly_2025.meta
 └── settings_appConfig.cache
 ```
 
@@ -352,7 +352,7 @@ var sameData = Cache.Get("dailyReport", "reports", () => GenerateDailyReport());
 **Large dataset caching:**
 ```csharp
 // Cache large datasets that might not fit entirely in memory
-var bigData = Cache.Get("dataset_2024", "analytics", () => LoadHugeDataset());
+var bigData = Cache.Get("dataset_2025", "analytics", () => LoadHugeDataset());
 ```
 
 **Cross-session data:**
@@ -394,6 +394,21 @@ foreach (var metadata in allMetadata)
         Console.WriteLine($"  Next Refresh: {metadata.NextRefreshTime:yyyy-MM-dd HH:mm:ss}");
         var timeUntilRefresh = metadata.NextRefreshTime.Value - DateTime.Now;
         Console.WriteLine($"  Time Until Refresh: {timeUntilRefresh:hh\\:mm\\:ss}");
+    }
+    
+    // Expiration information
+    if (metadata.HasAbsoluteExpiration)
+    {
+        Console.WriteLine($"  Absolute Expiration: {metadata.AbsoluteExpiration:yyyy-MM-dd HH:mm:ss}");
+        if (metadata.TimeUntilExpiration.HasValue)
+        {
+            Console.WriteLine($"  Time Until Expiration: {metadata.TimeUntilExpiration.Value:hh\\:mm\\:ss}");
+        }
+        Console.WriteLine($"  Is Expired: {metadata.IsExpired}");
+    }
+    if (metadata.HasSlidingExpiration)
+    {
+        Console.WriteLine($"  Sliding Expiration: {metadata.SlidingExpiration}");
     }
     
     // Persistent cache information
@@ -954,6 +969,14 @@ public class CacheItemMetadata
     
     // Method Information
     public string PopulateMethodName { get; set; }
+    
+    // Expiration Information
+    public DateTime AbsoluteExpiration { get; set; }
+    public TimeSpan SlidingExpiration { get; set; }
+    public bool HasAbsoluteExpiration { get; }
+    public bool HasSlidingExpiration { get; }
+    public TimeSpan? TimeUntilExpiration { get; }
+    public bool IsExpired { get; }
     
     // Persistent Cache Information
     public bool PersistentCacheEnabled { get; set; }

@@ -463,5 +463,47 @@ namespace CacheUtility.Tests
                 }
             }
         }
+
+        [Fact]
+        public void GetAllCacheMetadata_IncludesExpirationInformation()
+        {
+            // Arrange
+            const string groupName = "MetadataTestGroup";
+            var absoluteExpiration = DateTime.Now.AddHours(2);
+            var slidingExpiration = TimeSpan.FromMinutes(30);
+
+            // Create cache items with different expiration settings
+            Cache.Get("absoluteKey", groupName, absoluteExpiration, () => "value with absolute expiration");
+            Cache.Get("slidingKey", groupName, slidingExpiration, () => "value with sliding expiration");
+            Cache.Get("defaultKey", groupName, () => "value with default expiration");
+
+            // Act
+            var metadata = Cache.GetAllCacheMetadata().ToList();
+
+            // Assert
+            Assert.NotEmpty(metadata);
+
+            // Check absolute expiration item
+            var absoluteItem = metadata.FirstOrDefault(m => m.CacheKey == "absoluteKey");
+            Assert.NotNull(absoluteItem);
+            Assert.True(absoluteItem.HasAbsoluteExpiration, "Should have absolute expiration");
+            Assert.False(absoluteItem.HasSlidingExpiration, "Should not have sliding expiration");
+            Assert.NotEqual(DateTime.MaxValue, absoluteItem.AbsoluteExpiration);
+            Assert.NotNull(absoluteItem.TimeUntilExpiration);
+            Assert.False(absoluteItem.IsExpired);
+
+            // Check sliding expiration item
+            var slidingItem = metadata.FirstOrDefault(m => m.CacheKey == "slidingKey");
+            Assert.NotNull(slidingItem);
+            Assert.True(slidingItem.HasSlidingExpiration, "Should have sliding expiration");
+            Assert.Equal(slidingExpiration, slidingItem.SlidingExpiration);
+            Assert.Equal(TimeSpan.FromMinutes(30), slidingItem.SlidingExpiration);
+
+            // Check default expiration item (30 minutes sliding by default)
+            var defaultItem = metadata.FirstOrDefault(m => m.CacheKey == "defaultKey");
+            Assert.NotNull(defaultItem);
+            Assert.True(defaultItem.HasSlidingExpiration, "Should have default sliding expiration");
+            Assert.Equal(TimeSpan.FromMinutes(30), defaultItem.SlidingExpiration);
+        }
     }
 }

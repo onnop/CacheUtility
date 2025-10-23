@@ -618,7 +618,9 @@ namespace CacheUtility
                     CacheKey = originalCacheKey,
                     GroupName = groupName,
                     IsRefreshing = false,
-                    LastRefreshAttempt = DateTime.Now
+                    LastRefreshAttempt = DateTime.Now,
+                    AbsoluteExpiration = absoluteExpiration,
+                    SlidingExpiration = slidingExpiration
                 };
 
                 // Add to cache
@@ -893,7 +895,9 @@ namespace CacheUtility
                     CacheKey = originalCacheKey,
                     GroupName = groupName,
                     IsRefreshing = false,
-                    LastRefreshAttempt = persistentItem.LastRefreshTime
+                    LastRefreshAttempt = persistentItem.LastRefreshTime,
+                    AbsoluteExpiration = absoluteExpiration,
+                    SlidingExpiration = slidingExpiration
                 };
 
                 return cacheItem;
@@ -1221,6 +1225,16 @@ namespace CacheUtility
             public DateTime LastRefreshAttempt { get; set; }
 
             /// <summary>
+            /// Absolute expiration date for this cache item
+            /// </summary>
+            public DateTime AbsoluteExpiration { get; set; }
+
+            /// <summary>
+            /// Sliding expiration duration for this cache item
+            /// </summary>
+            public TimeSpan SlidingExpiration { get; set; }
+
+            /// <summary>
             /// The populate method used to refresh this cache item
             /// </summary>
             public Func<T> PopulateMethod
@@ -1383,6 +1397,8 @@ namespace CacheUtility
                     var refreshStartTimeProperty = cachedItem.GetType().GetProperty("RefreshStartTime");
                     var lastRefreshAttemptProperty = cachedItem.GetType().GetProperty("LastRefreshAttempt");
                     var populateMethodProperty = cachedItem.GetType().GetProperty("PopulateMethod");
+                    var absoluteExpirationProperty = cachedItem.GetType().GetProperty("AbsoluteExpiration");
+                    var slidingExpirationProperty = cachedItem.GetType().GetProperty("SlidingExpiration");
 
                     var actualItem = itemProperty?.GetValue(cachedItem);
                     if (actualItem == null) return null;
@@ -1393,6 +1409,8 @@ namespace CacheUtility
 
                     var lastRefreshTime = (DateTime)(lastRefreshTimeProperty?.GetValue(cachedItem) ?? DateTime.MinValue);
                     var refreshInterval = (TimeSpan)(refreshIntervalProperty?.GetValue(cachedItem) ?? TimeSpan.Zero);
+                    var absoluteExpiration = (DateTime)(absoluteExpirationProperty?.GetValue(cachedItem) ?? DateTime.MaxValue);
+                    var slidingExpiration = (TimeSpan)(slidingExpirationProperty?.GetValue(cachedItem) ?? TimeSpan.Zero);
 
                     var metadata = new CacheItemMetadata
                     {
@@ -1408,7 +1426,9 @@ namespace CacheUtility
                         CollectionCount = GetCollectionCount(actualItem),
                         PopulateMethodName = populateMethodName,
                         NextRefreshTime = CalculateNextRefreshTime(lastRefreshTime, refreshInterval),
-                        PersistentCacheEnabled = _persistentOptions != null
+                        PersistentCacheEnabled = _persistentOptions != null,
+                        AbsoluteExpiration = absoluteExpiration,
+                        SlidingExpiration = slidingExpiration
                     };
 
                     // Add persistent cache information
@@ -1431,7 +1451,9 @@ namespace CacheUtility
                         CollectionCount = GetCollectionCount(cachedItem),
                         PopulateMethodName = null, // Unknown for direct cached items
                         NextRefreshTime = null, // No refresh for direct cached items
-                        PersistentCacheEnabled = _persistentOptions != null
+                        PersistentCacheEnabled = _persistentOptions != null,
+                        AbsoluteExpiration = DateTime.MaxValue, // Unknown for direct cached items
+                        SlidingExpiration = TimeSpan.Zero // Unknown for direct cached items
                     };
 
                     // Add persistent cache information
@@ -1727,6 +1749,36 @@ namespace CacheUtility
         /// Age of the persistent cache file (time since last write)
         /// </summary>
         public TimeSpan? PersistentFileAge => LastPersistedTime.HasValue ? DateTime.Now - LastPersistedTime.Value : null;
+
+        /// <summary>
+        /// Absolute expiration date for this cache item
+        /// </summary>
+        public DateTime AbsoluteExpiration { get; set; }
+
+        /// <summary>
+        /// Sliding expiration duration for this cache item
+        /// </summary>
+        public TimeSpan SlidingExpiration { get; set; }
+
+        /// <summary>
+        /// Whether the cache item has an absolute expiration set
+        /// </summary>
+        public bool HasAbsoluteExpiration => AbsoluteExpiration != DateTime.MaxValue && AbsoluteExpiration != default;
+
+        /// <summary>
+        /// Whether the cache item has a sliding expiration set
+        /// </summary>
+        public bool HasSlidingExpiration => SlidingExpiration > TimeSpan.Zero;
+
+        /// <summary>
+        /// Time remaining until absolute expiration (null if no absolute expiration)
+        /// </summary>
+        public TimeSpan? TimeUntilExpiration => HasAbsoluteExpiration ? AbsoluteExpiration - DateTime.Now : null;
+
+        /// <summary>
+        /// Whether the cache item is currently expired based on absolute expiration
+        /// </summary>
+        public bool IsExpired => HasAbsoluteExpiration && DateTime.Now > AbsoluteExpiration;
     }
 
     /// <summary>

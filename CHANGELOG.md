@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] - 2025-10-23
+
+### Added
+- **Expiration Information in Metadata**: `GetAllCacheMetadata()` now returns comprehensive expiration details for each cache item
+  - `AbsoluteExpiration`: The absolute expiration date (if set)
+  - `SlidingExpiration`: The sliding expiration duration (if set)
+  - `HasAbsoluteExpiration`: Boolean indicating if absolute expiration is configured
+  - `HasSlidingExpiration`: Boolean indicating if sliding expiration is configured
+  - `TimeUntilExpiration`: Calculated time remaining until absolute expiration
+  - `IsExpired`: Boolean indicating if the item has expired based on absolute expiration
+
+### Improved
+- Enhanced cache monitoring and debugging capabilities with complete expiration visibility
+- Better insight into cache item lifecycle and expiration status
+
 ## [1.2.0] - 2024-12-19
 
 ### Changed
@@ -70,6 +85,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 
 ## Migration Guide
+
+### From v1.2.0 to v1.2.1
+
+**✅ Fully Backward Compatible** - No breaking changes!
+
+#### New Features Available:
+1. **Enhanced Metadata with Expiration Information** (automatic):
+   ```csharp
+   var metadata = Cache.GetAllCacheMetadata();
+   foreach (var item in metadata)
+   {
+       // New expiration properties
+       if (item.HasAbsoluteExpiration)
+       {
+           Console.WriteLine($"Expires at: {item.AbsoluteExpiration}");
+           Console.WriteLine($"Time until expiration: {item.TimeUntilExpiration}");
+           Console.WriteLine($"Is expired: {item.IsExpired}");
+       }
+       if (item.HasSlidingExpiration)
+       {
+           Console.WriteLine($"Sliding expiration: {item.SlidingExpiration}");
+       }
+   }
+   ```
+
+#### Performance Impact:
+- **Zero impact** on existing code
+- Metadata extraction uses reflection (same as before)
+- No additional overhead in cache operations
 
 ### From v1.0.x to v1.1.0
 
