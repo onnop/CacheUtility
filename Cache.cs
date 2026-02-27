@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.IO;
@@ -9,6 +9,8 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 [assembly: InternalsVisibleTo("CacheUtility.Tests")]
 
@@ -19,6 +21,17 @@ namespace CacheUtility
     /// </summary>
     public abstract class Cache
     {
+        private static ILogger _logger = NullLogger.Instance;
+
+        /// <summary>
+        /// Configures logging for CacheUtility. Call once at application startup.
+        /// When using DI, prefer <c>services.AddCacheLogging()</c> instead.
+        /// </summary>
+        public static void ConfigureLogging(ILoggerFactory loggerFactory)
+        {
+            _logger = loggerFactory?.CreateLogger("CacheUtility") ?? NullLogger.Instance;
+        }
+
         /// <summary>
         /// Groups that depend on each other when removing from the cache
         /// </summary>
@@ -149,8 +162,13 @@ namespace CacheUtility
             // If item doesn't exist, we must load it synchronously (no choice)
             if (item == null)
             {
+                if (_logger.IsEnabled(LogLevel.Debug))
+                    _logger.LogDebug("Cache miss: {CacheKey} in group {GroupName}", originalCacheKey, groupName);
                 return LoadCacheItemSynchronously(cacheKey, originalCacheKey, groupName, absoluteExpiration, slidingExpiration, priority, populateMethod, removedCallback, refresh);
             }
+
+            if (_logger.IsEnabled(LogLevel.Debug))
+                _logger.LogDebug("Cache hit: {CacheKey} in group {GroupName}", originalCacheKey, groupName);
 
             // Item exists - check if refresh is needed
             var needsRefresh = false;
@@ -177,6 +195,9 @@ namespace CacheUtility
         /// <param name="groupName">Name of the cache group.</param>
         public static void Remove(string cacheKey, string groupName)
         {
+            if (_logger.IsEnabled(LogLevel.Debug))
+                _logger.LogDebug("Removing cache key: {CacheKey} from group {GroupName}", cacheKey, groupName);
+
             // Combine cachekey with the groupkey to create a unique key
             cacheKey = string.Format("{0}_{1}", groupName, cacheKey);
 
@@ -241,6 +262,9 @@ namespace CacheUtility
         /// </summary>
         public static void RemoveAll()
         {
+            if (_logger.IsEnabled(LogLevel.Debug))
+                _logger.LogDebug("Removing all cached items ({Count} keys registered)", RegisteredKeys.Count);
+
             lock (CacheLock)
             {
                 // Cannot do ForEach, since we are modifying the collection
@@ -312,8 +336,13 @@ namespace CacheUtility
             {
                 if (!RegisteredGroups.TryGetValue(groupName, out var group))
                 {
+                    if (_logger.IsEnabled(LogLevel.Debug))
+                        _logger.LogDebug("RemoveGroup: group {GroupName} not found, skipping", groupName);
                     return;
                 }
+
+                if (_logger.IsEnabled(LogLevel.Debug))
+                    _logger.LogDebug("Removing cache group {GroupName} ({KeyCount} keys)", groupName, group.SubKeys.Count);
 
                 var keys = new List<string>();
                 lock (CacheLock)
@@ -376,6 +405,11 @@ namespace CacheUtility
         public static void EnablePersistentCache(PersistentCacheOptions options)
         {
             if (options == null) throw new ArgumentNullException(nameof(options));
+
+            if (_logger.IsEnabled(LogLevel.Debug))
+                _logger.LogDebug("Enabling persistent cache (directory: {Directory}, groups: {Groups})",
+                    options.BaseDirectory,
+                    options.PersistentGroups?.Length > 0 ? string.Join(", ", options.PersistentGroups) : "none");
 
             lock (CacheLock)
             {
@@ -699,6 +733,9 @@ namespace CacheUtility
                 cacheItem.LastRefreshAttempt = DateTime.Now;
             }
 
+            if (_logger.IsEnabled(LogLevel.Debug))
+                _logger.LogDebug("Starting background refresh for {CacheKey} in group {GroupName}", cacheItem.CacheKey, cacheItem.GroupName);
+
             // Start background refresh task
             cacheItem.RefreshTask = Task.Run(() =>
             {
@@ -716,11 +753,14 @@ namespace CacheUtility
 
                     // Update the cache item with minimal locking
                     UpdateCacheItemValue(cacheItem, newValue);
+
+                    if (_logger.IsEnabled(LogLevel.Debug))
+                        _logger.LogDebug("Background refresh completed for {CacheKey} in group {GroupName}", cacheItem.CacheKey, cacheItem.GroupName);
                 }
-                catch (Exception)
+                catch (Exception ex)
                 {
-                    // If refresh fails, we keep the existing data and will try again later
-                    // This ensures the cache remains available even if populate method fails
+                    if (_logger.IsEnabled(LogLevel.Warning))
+                        _logger.LogWarning(ex, "Background refresh failed for {CacheKey} in group {GroupName}", cacheItem.CacheKey, cacheItem.GroupName);
                 }
                 finally
                 {

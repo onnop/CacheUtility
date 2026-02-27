@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-02-24
+
+### Added
+- **Built-in diagnostic logging** via `Microsoft.Extensions.Logging`
+  - All key cache operations (Get, Remove, RemoveGroup, RemoveAll, background refresh) emit Debug-level log messages
+  - Structured log messages with `{CacheKey}` and `{GroupName}` properties for easy filtering
+  - Warning-level logging for failed background refresh operations
+- **DI integration** with `services.AddCacheLogging()` extension method
+  - Automatically wires the application's `ILoggerFactory` into CacheUtility on host startup via `IHostedService`
+  - Zero manual configuration — no need to call `Cache.ConfigureLogging()` explicitly
+- **Manual configuration** via `Cache.ConfigureLogging(ILoggerFactory)` for non-DI scenarios
+
+### Technical details
+- Added dependencies: `Microsoft.Extensions.Logging.Abstractions`, `Microsoft.Extensions.Hosting.Abstractions`, `Microsoft.Extensions.DependencyInjection.Abstractions`
+- Uses `NullLogger.Instance` by default, so logging has zero overhead when not configured
+- Serilog namespace overrides can control verbosity per environment (e.g. Debug for dev, Warning for production)
+
 ## [1.2.1] - 2025-10-23
 
 ### Added
@@ -86,6 +103,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Migration Guide
 
+### From v1.2.x to v1.3.0
+
+**Fully backward compatible** — no breaking changes!
+
+#### New features available:
+1. **DI-based logging** (recommended):
+   ```csharp
+   builder.Services.AddCacheLogging();
+   ```
+   That's it. Logging is wired automatically when the host starts.
+
+2. **Manual logging** (for non-DI scenarios):
+   ```csharp
+   Cache.ConfigureLogging(myLoggerFactory);
+   ```
+
+3. **Serilog namespace override** (optional, to control verbosity):
+   ```json
+   "Serilog": {
+     "MinimumLevel": {
+       "Override": {
+         "CacheUtility": "Debug"
+       }
+     }
+   }
+   ```
+
+#### Performance impact:
+- **Zero overhead** when logging is not configured (default `NullLogger`)
+- Minimal overhead with logging enabled (structured log calls at Debug level)
+
 ### From v1.2.0 to v1.2.1
 
 **✅ Fully Backward Compatible** - No breaking changes!
@@ -166,7 +214,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - [ ] Distributed cache support (Redis, SQL Server)
 - [ ] Cache warming strategies
 - [ ] Advanced eviction policies
-- [ ] Integration with ASP.NET Core DI container
+- [x] Integration with ASP.NET Core DI container (v1.3.0)
+- [x] Built-in diagnostic logging (v1.3.0)
 - [ ] Metrics integration (Prometheus, Application Insights)
 
 ### Under Consideration

@@ -1,4 +1,4 @@
-﻿# CacheUtility
+# CacheUtility
 
 [![NuGet Version](https://img.shields.io/nuget/v/CacheUtility.svg)](https://www.nuget.org/packages/CacheUtility/)
 [![NuGet Downloads](https://img.shields.io/nuget/dt/CacheUtility.svg)](https://www.nuget.org/packages/CacheUtility/)
@@ -19,6 +19,7 @@ CacheUtility provides an easy-to-use abstraction over the standard .NET memory c
 - **Automatic background refresh** functionality for non-blocking updates
 - **Persistent cache storage** for data that survives application restarts
 - **Comprehensive metadata and monitoring** for cache analysis and debugging
+- **Built-in diagnostic logging** with `services.AddCacheLogging()` — zero-config DI integration
 
 ## Installation
 
@@ -36,7 +37,7 @@ dotnet add package CacheUtility
 
 ### PackageReference
 ```xml
-<PackageReference Include="CacheUtility" Version="1.2.1" />
+<PackageReference Include="CacheUtility" Version="1.3.1" />
 ```
 
 ## Quick Start
@@ -1079,3 +1080,59 @@ The CacheUtility is built on top of .NET's MemoryCache, which has built-in memor
 ## Thread safety
 
 All operations in CacheUtility are thread-safe. The implementation uses ReaderWriterLockSlim for efficient concurrent access and CacheLock for synchronizing modifications to the cache.
+
+## Logging
+
+CacheUtility includes built-in diagnostic logging via `Microsoft.Extensions.Logging`. All key cache operations emit structured Debug-level log messages.
+
+### Enabling logging (DI)
+
+One line in your service registration:
+
+```csharp
+builder.Services.AddCacheLogging();
+```
+
+This automatically connects CacheUtility to your application's logging pipeline on host startup. Works seamlessly with Serilog, NLog, or any `ILoggerFactory`-based provider.
+
+### Enabling logging (non-DI)
+
+For console apps or other non-DI scenarios:
+
+```csharp
+var loggerFactory = LoggerFactory.Create(builder => builder.AddConsole());
+Cache.ConfigureLogging(loggerFactory);
+```
+
+### Controlling log verbosity
+
+CacheUtility logs under the `"CacheUtility"` source name. Use your logging framework's namespace overrides to control verbosity per environment:
+
+```json
+{
+  "Serilog": {
+    "MinimumLevel": {
+      "Default": "Information",
+      "Override": {
+        "CacheUtility": "Debug"
+      }
+    }
+  }
+}
+```
+
+### What gets logged
+
+| Operation | Level | Example message |
+|-----------|-------|-----------------|
+| Cache hit | Debug | `Cache hit: {CacheKey} in group {GroupName}` |
+| Cache miss | Debug | `Cache miss: {CacheKey} in group {GroupName}` |
+| Remove key | Debug | `Removing cache key: {CacheKey} from group {GroupName}` |
+| Remove group | Debug | `Removing cache group {GroupName} ({KeyCount} keys)` |
+| Remove all | Debug | `Removing all cached items ({Count} keys registered)` |
+| Background refresh start | Debug | `Starting background refresh for {CacheKey}` |
+| Background refresh done | Debug | `Background refresh completed for {CacheKey}` |
+| Background refresh fail | Warning | `Background refresh failed for {CacheKey}` |
+| Persistent cache enabled | Debug | `Enabling persistent cache (directory: ...)` |
+
+When logging is not configured, `NullLogger` is used — zero overhead.
