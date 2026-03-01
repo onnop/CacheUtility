@@ -163,7 +163,13 @@ namespace CacheUtility
             if (item == null)
             {
                 if (_logger.IsEnabled(LogLevel.Debug))
-                    _logger.LogDebug("Cache miss: {CacheKey} in group {GroupName}", originalCacheKey, groupName);
+                {
+                    var methodInfo = populateMethod.Method;
+                    var methodName = methodInfo.DeclaringType != null 
+                        ? $"{methodInfo.DeclaringType.Name}.{methodInfo.Name}" 
+                        : methodInfo.Name;
+                    _logger.LogDebug("Cache miss, loading data: {CacheKey} in group {GroupName} using {MethodName}", originalCacheKey, groupName, methodName);
+                }
                 return LoadCacheItemSynchronously(cacheKey, originalCacheKey, groupName, absoluteExpiration, slidingExpiration, priority, populateMethod, removedCallback, refresh);
             }
 
