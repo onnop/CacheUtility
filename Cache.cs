@@ -173,8 +173,8 @@ namespace CacheUtility
                 return LoadCacheItemSynchronously(cacheKey, originalCacheKey, groupName, absoluteExpiration, slidingExpiration, priority, populateMethod, removedCallback, refresh);
             }
 
-            if (_logger.IsEnabled(LogLevel.Debug))
-                _logger.LogDebug("Cache hit: {CacheKey} in group {GroupName}", originalCacheKey, groupName);
+            if (_logger.IsEnabled(LogLevel.Trace))
+                _logger.LogTrace("Cache hit: {CacheKey} in group {GroupName}", originalCacheKey, groupName);
 
             // Item exists - check if refresh is needed
             var needsRefresh = false;

@@ -37,7 +37,7 @@ dotnet add package CacheUtility
 
 ### PackageReference
 ```xml
-<PackageReference Include="CacheUtility" Version="1.3.1" />
+<PackageReference Include="CacheUtility" Version="1.3.5" />
 ```
 
 ## Quick Start
@@ -1125,8 +1125,8 @@ CacheUtility logs under the `"CacheUtility"` source name. Use your logging frame
 
 | Operation | Level | Example message |
 |-----------|-------|-----------------|
-| Cache hit | Debug | `Cache hit: {CacheKey} in group {GroupName}` |
-| Cache miss | Debug | `Cache miss: {CacheKey} in group {GroupName}` |
+| Cache hit | Trace | `Cache hit: {CacheKey} in group {GroupName}` |
+| Cache miss | Debug | `Cache miss, loading data: {CacheKey} in group {GroupName} using {MethodName}` |
 | Remove key | Debug | `Removing cache key: {CacheKey} from group {GroupName}` |
 | Remove group | Debug | `Removing cache group {GroupName} ({KeyCount} keys)` |
 | Remove all | Debug | `Removing all cached items ({Count} keys registered)` |

@@ -3,7 +3,7 @@
   <PropertyGroup>
     <TargetFramework>net9.0</TargetFramework>
     <GeneratePackageOnBuild>False</GeneratePackageOnBuild>
-    <Version>1.3.4</Version>
+    <Version>1.3.5</Version>
     <Title>Thread-Safe .NET Memory Cache with Groups, Dependencies, Auto-Population &amp; Persistent Storage</Title>
     <Authors>Onno Pistorius</Authors>
     <Company>Athena ICT</Company>
@@ -27,7 +27,7 @@ Perfect for high-performance applications requiring sophisticated caching patter
     <PackageProjectUrl>https://www.athenaict.com/NuGet/Cache</PackageProjectUrl>
     <PackageIcon>Logo_initials.png</PackageIcon>
     <PackageTags>cache;caching;memory-cache;persistent-cache;thread-safe;cache-groups;cache-dependencies;auto-population;performance;dotnet;system-runtime-caching;cache-management;high-performance;scalability;cache-utility;bulk-retrieval;monitoring;metadata;statistics;disk-storage;json-serialization;auto-refresh;cache-monitoring;</PackageTags>
-    <PackageReleaseNotes>v1.3.4: Enhanced cache miss log messages to include populate method name for better debugging.</PackageReleaseNotes>
+    <PackageReleaseNotes>v1.3.5: Cache hit logs moved to Trace level to reduce log noise; cache miss logs now include populate method name.</PackageReleaseNotes>
     <PackageId>CacheUtility</PackageId>
     <Product>CacheUtility</Product>
     <PackageLicenseFile>License.txt</PackageLicenseFile>
