@@ -2,8 +2,8 @@
 
   <PropertyGroup>
     <TargetFramework>net9.0</TargetFramework>
-    <GeneratePackageOnBuild>False</GeneratePackageOnBuild>
-    <Version>1.4.0</Version>
+    <GeneratePackageOnBuild>True</GeneratePackageOnBuild>
+    <Version>1.4.1</Version>
     <Title>Thread-Safe .NET Memory Cache with Groups, Dependencies, Auto-Population &amp; Persistent Storage</Title>
     <Authors>Onno Pistorius</Authors>
     <Company>Athena ICT</Company>

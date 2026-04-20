@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.1] - 2026-04-20
+
+### Fixed
+- **Deadlock under single-threaded SynchronizationContext when sync `Get` received a `Task`-returning populate method.** Since 1.4.0, `RecomputeEstimatedSize` and `EstimateObjectSize` eagerly serialized the populated value with `System.Text.Json`. When callers used the long-supported sync-over-async pattern
+  ```csharp
+  var result = await Cache.Get(key, group, absoluteExpiration, async () => { ... }, refresh: TimeSpan.Zero);
+  ```
+  the populate returns a pending `Task<T>`, which is stored as the cache value. `JsonSerializer.Serialize` walks `Task<T>.Result`, which blocks until the task completes. Under a single-threaded context (Blazor Server's `RendererSynchronizationContext`, WPF, WinForms) the task's continuation cannot run → hang. Both size-estimation paths now short-circuit when the value is a `Task` and return a nominal size instead.
+
+### Added
+- **One-time Warning diagnostic** when a synchronous `Cache.Get` call receives a `Task`-returning populate method. The warning is deduplicated by populate call-site so it logs at most once per site per process, and points the caller at the matching `Cache.GetAsync` overload. Helps teams migrate off the legacy sync-over-async pattern without surprise.
+
 ## [1.4.0] - 2026-04-19
 
 ### Added

@@ -80,6 +80,14 @@ namespace CacheUtility
             new ConcurrentDictionary<string, Task<object>>(StringComparer.Ordinal);
 
         /// <summary>
+        /// Deduplicates the "sync Get received a Task-returning populate" warning so each populate
+        /// method warns at most once per process. The key is the populate method identifier returned
+        /// by <see cref="GetMethodName"/>; value is unused.
+        /// </summary>
+        private static readonly ConcurrentDictionary<string, byte> _taskPopulateWarningsEmitted =
+            new ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
+
+        /// <summary>
         /// Persistent cache configuration options. Volatile for safe publication across threads.
         /// </summary>
         private static volatile PersistentCacheOptions _persistentOptions;
@@ -716,6 +724,8 @@ namespace CacheUtility
             }
 
             var value = populateMethod.Invoke();
+            WarnOnTaskReturningSyncPopulate(value, populateMethod, cacheKey, groupName);
+
             var item = new CacheItem<TData>
             {
                 Item = value,
@@ -735,6 +745,62 @@ namespace CacheUtility
             SaveToPersistentCache(fullKey, item, absoluteExpiration, slidingExpiration);
 
             return item;
+        }
+
+        /// <summary>
+        /// Emit a one-time Warning when a synchronous <see cref="Get{TData}(string, string, TimeSpan, Func{TData}, TimeSpan)"/>
+        /// call receives a <see cref="Task"/>-returning populate method. The resulting cache entry stores
+        /// the Task itself, which:
+        /// (1) prevents the size-estimator, persistent cache, and metadata introspection from ever
+        ///     seeing the actual value,
+        /// (2) historically caused deadlocks under single-threaded SynchronizationContexts when
+        ///     serializers walked <c>Task&lt;T&gt;.Result</c>, and
+        /// (3) is almost always a sign the caller meant to use <see cref="GetAsync{TData}(string, string, TimeSpan, Func{Task{TData}}, TimeSpan, CancellationToken)"/>.
+        /// Warnings are deduplicated by populate call-site identity so each call site logs at most once.
+        /// </summary>
+        private static void WarnOnTaskReturningSyncPopulate(object value, Delegate populateMethod, string cacheKey, string groupName)
+        {
+            if (!(value is Task)) return;
+            if (_logger == NullLogger.Instance) return; // Cheap bail-out when logging isn't configured.
+            if (!_logger.IsEnabled(LogLevel.Warning)) return;
+
+            var siteKey = GetPopulateSiteKey(populateMethod);
+            if (!_taskPopulateWarningsEmitted.TryAdd(siteKey, 0)) return;
+
+            _logger.LogWarning(
+                "CacheUtility: synchronous Get('{CacheKey}' in group '{GroupName}') received a Task-returning populate method ('{PopulateSite}'). " +
+                "The Task itself will be cached, not its result. This pattern can deadlock under single-threaded SynchronizationContexts " +
+                "(Blazor Server, WPF, WinForms) because cache bookkeeping may walk Task<T>.Result. " +
+                "Switch to Cache.GetAsync(...) with the same async lambda. This warning is logged once per populate call site.",
+                cacheKey, groupName, siteKey);
+        }
+
+        /// <summary>
+        /// Test-only reset of the <c>Task</c>-populate warning deduplication set. Not part of the
+        /// public API; exposed via <c>InternalsVisibleTo</c> so tests can isolate warning counts
+        /// from earlier test runs.
+        /// </summary>
+        internal static void ResetTaskPopulateWarningsForTesting() => _taskPopulateWarningsEmitted.Clear();
+
+        /// <summary>
+        /// Returns a stable, site-unique identifier for a populate delegate, suitable for deduplicating
+        /// diagnostics. Unlike <see cref="GetMethodName"/>, compiler-generated lambdas and async state
+        /// machines return the fully-qualified declaring-type+method name — which encodes the enclosing
+        /// user method — so different call sites get different keys.
+        /// </summary>
+        private static string GetPopulateSiteKey(Delegate method)
+        {
+            if (method?.Method == null) return "<unknown>";
+            try
+            {
+                var mi = method.Method;
+                var declType = mi.DeclaringType?.FullName ?? mi.DeclaringType?.Name ?? "<anon>";
+                return declType + "." + mi.Name;
+            }
+            catch
+            {
+                return "<unknown>";
+            }
         }
 
         /// <summary>
@@ -834,6 +900,7 @@ namespace CacheUtility
                     if (currentItem == null || currentItem != cacheItem) return;
 
                     var newValue = cacheItem.PopulateMethodCache.Invoke();
+                    WarnOnTaskReturningSyncPopulate(newValue, cacheItem.PopulateMethodCache, cacheItem.CacheKey, cacheItem.GroupName);
                     UpdateCacheItemValue(cacheItem, newValue);
 
                     if (_logger.IsEnabled(LogLevel.Debug))
@@ -1369,6 +1436,14 @@ namespace CacheUtility
         {
             if (obj == null) return 0;
 
+            // A cached value may itself be a Task<T> when callers use the common
+            // sync-Get-with-async-lambda pattern (`await Cache.Get(..., async () => ...)`).
+            // Running JsonSerializer.Serialize on a Task walks Task<T>.Result and blocks
+            // until the task completes. If we're on a single-threaded SynchronizationContext
+            // (Blazor Server, WPF/WinForms, xUnit 2.x test runner) and that task's continuation
+            // needs the same context, we deadlock. Refuse to serialize Task-typed values.
+            if (obj is Task) return TaskSizeFallback(obj);
+
             try
             {
                 var json = JsonSerializer.Serialize(obj, CacheJsonOptions);
@@ -1376,18 +1451,30 @@ namespace CacheUtility
             }
             catch
             {
-                return obj switch
-                {
-                    string str => str.Length * 2,
-                    int => 4,
-                    long => 8,
-                    double => 8,
-                    float => 4,
-                    bool => 1,
-                    DateTime => 8,
-                    _ => 64
-                };
+                return SerializationFailureFallback(obj);
             }
+        }
+
+        private static long TaskSizeFallback(object obj)
+        {
+            // We can't safely introspect the Task's value, so report a nominal size.
+            // The Task object header + state is typically <200 bytes.
+            return 128;
+        }
+
+        private static long SerializationFailureFallback(object obj)
+        {
+            return obj switch
+            {
+                string str => str.Length * 2,
+                int => 4,
+                long => 8,
+                double => 8,
+                float => 4,
+                bool => 1,
+                DateTime => 8,
+                _ => 64
+            };
         }
 
         private static int? GetCollectionCount(object obj)
@@ -1617,6 +1704,15 @@ namespace CacheUtility
                 if (Item == null)
                 {
                     _cachedEstimatedSize = 0;
+                    return;
+                }
+
+                // Guard against Task-typed cache values. See EstimateObjectSize for the
+                // full explanation: JsonSerializer would walk Task<T>.Result and deadlock
+                // under a single-threaded SynchronizationContext.
+                if (Item is Task)
+                {
+                    _cachedEstimatedSize = null;
                     return;
                 }
 
