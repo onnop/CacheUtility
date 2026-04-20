@@ -9,139 +9,133 @@ alwaysApply: false
 
 ### Prerequisites
 - .NET 9.0 SDK
-- Visual Studio or VS Code with C# extension
-- NuGet CLI (for package operations)
+- Visual Studio 2022, JetBrains Rider, or VS Code with the C# Dev Kit
+- (Optional) NuGet CLI for local package experimentation
 
 ### Build Commands
 ```bash
-# Build the solution
+# Build the whole solution
 dotnet build CacheUtility.sln
 
-# Build with specific configuration
-dotnet build --configuration Release
+# Release build
+dotnet build CacheUtility.sln --configuration Release
 
 # Run tests
-dotnet test CacheUtility.Tests/
+dotnet test CacheUtility.Tests
 
-# Pack NuGet package
-dotnet pack --configuration Release
+# Pack a NuGet package locally
+dotnet pack --configuration Release --output ./nupkg
 ```
 
 ## Testing Strategy
 
 ### Unit Test Execution
-Tests are located in [CacheUtility.Tests/](mdc:CacheUtility.Tests) directory:
+Tests live in [CacheUtility.Tests/](mdc:CacheUtility.Tests):
 ```bash
 # Run all tests
 dotnet test
 
-# Run with detailed output
+# Verbose output
 dotnet test --logger "console;verbosity=detailed"
 
-# Test specific class/method
-dotnet test --filter "GetAllByGroupTests"
+# Run a single test class
+dotnet test --filter "FullyQualifiedName~NewApiTests"
+
+# Run a single test method
+dotnet test --filter "FullyQualifiedName~NewApiTests.GetAsync_PopulatesValueOnce"
 ```
 
+> The test assembly disables xUnit parallelization via [TestCollectionConfig.cs](mdc:CacheUtility.Tests/TestCollectionConfig.cs); tests run sequentially because the `Cache` class is static.
+
 ### Test Coverage Areas
-Based on [GetAllByGroupTests.cs](mdc:GetAllByGroupTests.cs):
-1. **Functional Testing**: Core cache operations work correctly
-2. **Edge Case Testing**: Empty groups, null parameters
-3. **Data Type Testing**: Various .NET types (string, int, DateTime, collections)
-4. **Cleanup Testing**: Cache removal and disposal
-5. **Thread Safety Testing**: Concurrent access scenarios
+1. **Functional**: Core cache operations work for sync and async populate methods.
+2. **Edge cases**: Null arguments, empty groups, type mismatches in `TryGet<T>` / `GetAllByGroup<T>`.
+3. **Data type variety**: Strings, ints, custom POCOs, collections, nullables.
+4. **Concurrency**: A single populate invocation under N concurrent callers (see [NewApiTests.cs](mdc:CacheUtility.Tests/NewApiTests.cs)).
+5. **Persistent cache**: Round-trip, atomic writes, orphaned-file cleanup, sliding-touch throttle, group whitelist (see [PersistentCacheHardeningTests.cs](mdc:CacheUtility.Tests/PersistentCacheHardeningTests.cs)).
+6. **Bug-fix regressions**: Anything previously broken should land alongside a regression test in [BugFixTests.cs](mdc:CacheUtility.Tests/BugFixTests.cs).
+7. **Cleanup**: `Cache.RemoveAll()` and `Cache.DisablePersistentCache()` in both setup and `Dispose`.
 
 ### Adding New Tests
-Follow the established pattern:
-1. Inherit from `IDisposable`
-2. Clean cache in constructor and `Dispose()`
-3. Use descriptive test method names
-4. Follow Arrange-Act-Assert pattern
-5. Test both positive and negative scenarios
+1. Inherit from `IDisposable` and clean up shared `Cache` state in both the constructor and `Dispose`.
+2. Use descriptive method names: `MethodUnderTest_Scenario_ExpectedResult`.
+3. Follow Arrange-Act-Assert.
+4. Cover both happy path and at least one failure / edge case per new public API.
 
 ## Release Process
 
 ### Version Management
-Update version in [CacheUtility.csproj](mdc:CacheUtility.csproj):
-1. Increment `<Version>` appropriately (major.minor.patch)
-2. Update `<PackageReleaseNotes>` with changes
-3. Review and update `<PackageTags>` if needed
-4. Ensure `<Description>` reflects current capabilities
+Update [CacheUtility.csproj](mdc:CacheUtility.csproj) for every release:
+1. Bump `<Version>` (semver: `MAJOR.MINOR.PATCH`).
+2. Append a new section to `<PackageReleaseNotes>` (don't drop history).
+3. Add a matching `[X.Y.Z] - YYYY-MM-DD` entry to [CHANGELOG.md](mdc:CHANGELOG.md).
+4. Update the `Version=` value in the [README.md](mdc:README.md) PackageReference example.
+5. Review `<PackageTags>` and `<Description>` if user-visible capabilities changed.
 
 ### Pre-Release Checklist
-1. **Code Quality**:
-   - All unit tests pass
-   - Code follows established patterns in [CacheUtility.cs](mdc:CacheUtility.cs)
-   - XML documentation is complete
-   - No linter warnings
-
+1. **Code quality**:
+   - `dotnet build --configuration Release` is green with **0 warnings**.
+   - `dotnet test` is green.
+   - All new public APIs have XML documentation.
 2. **Documentation**:
-   - [README.md](mdc:README.md) reflects new features
-   - Code examples are tested and working
-   - API documentation is current
+   - [README.md](mdc:README.md) reflects new features and the new version number.
+   - Code samples in the README compile and behave as described.
+   - [CHANGELOG.md](mdc:CHANGELOG.md) has the new version.
+3. **Package configuration**:
+   - `<Version>`, `<PackageReleaseNotes>`, and `<PackageTags>` are accurate.
+   - `License.txt` and the readme are still referenced in the `.csproj` `<None>` items.
 
-3. **Package Configuration**:
-   - Package metadata is accurate
-   - License file ([License.txt](mdc:License.txt)) is included
-   - Logo and readme files are properly referenced
-
-### NuGet Package Creation
+### NuGet Package Publishing
+The published flow is automated via [main.yml](mdc:.github/workflows/main.yml) — pushing a `vX.Y.Z` tag triggers build + pack + push to nuget.org using the `NUGET_API_KEY` secret. Manual fallback:
 ```bash
-# Create package
 dotnet pack --configuration Release --output ./nupkg
-
-# Test package locally
-dotnet add package CacheUtility --source ./nupkg
-
-# Publish to NuGet (requires API key)
 dotnet nuget push ./nupkg/*.nupkg --source https://api.nuget.org/v3/index.json --api-key YOUR_API_KEY
 ```
 
 ## Development Best Practices
 
 ### Code Changes
-1. **Single Responsibility**: Each method should have a clear purpose
-2. **Backward Compatibility**: Avoid breaking existing API contracts
-3. **Performance**: Consider cache performance implications
-4. **Thread Safety**: Maintain thread-safe operations
+1. **Single responsibility**: each method does one thing.
+2. **Backward compatibility**: never break an existing public signature. Soft-deprecate with `<remarks>` + `<see cref>` to the preferred replacement.
+3. **Performance**: keep the hot path (`Get` / `GetAsync` / `TryGet`) lock-free and reflection-free.
+4. **Thread safety**: use `ConcurrentDictionary` / `Lazy<T>` / shared `Task<T>` for new shared state. Reach for `lock (CacheLock)` only when the operation must be globally serialized.
 
 ### Git Workflow
-1. Create feature branches for new functionality
-2. Write tests before implementing features (TDD approach)
-3. Keep commits focused and well-documented
-4. Test thoroughly before merging to main branch
+1. Create feature branches off `master` for non-trivial work.
+2. Land tests and the implementation in the same PR.
+3. Keep commits focused; prefer small, well-described commits over one giant squash.
+4. Tag releases as `vX.Y.Z` to trigger the publish workflow.
 
 ### Performance Testing
-When making changes that could affect performance:
-1. Create benchmarks for critical paths
-2. Test with realistic data sizes
-3. Monitor memory usage and garbage collection
-4. Test concurrent access scenarios
+For changes that could affect the hot path:
+1. Re-run / extend BenchmarkDotNet measurements (see the **Performance Benchmarks** section of [README.md](mdc:README.md) for the current reference numbers and methodology).
+2. Test with realistic data sizes.
+3. Verify GC pressure has not regressed.
+4. Stress-test concurrent populate, refresh, and removal scenarios.
 
 ## Debugging Guidelines
 
 ### Common Issues
-1. **Thread Deadlocks**: Check lock ordering and release
-2. **Memory Leaks**: Ensure proper disposal of ReaderWriterLockSlim
-3. **Cache Misses**: Verify key combination logic
-4. **Group Dependencies**: Check recursive removal logic
+1. **Thread deadlocks**: Almost always caused by invoking a user populate callback while holding `CacheLock`. The current code goes out of its way to avoid this — keep it that way.
+2. **Stale cached values**: Check the `refresh` interval and the auto-refresh background task; verify the populate method isn't throwing and being silently swallowed.
+3. **Cache misses where you expect a hit**: Verify the group + key combination produces the same internal key (`groupName_cacheKey`).
+4. **Persistent cache not loading on restart**: Confirm `EnablePersistentCache(...)` is called *before* the first `Get`, and that the directory permissions allow read/write.
+5. **Dependency cascade not firing**: Confirm `SetDependencies(parent, children...)` is called *before* `RemoveGroup(parent)`, and remember `SetDependencies` *replaces* the dependency list.
 
 ### Debugging Tools
-- Use debugger breakpoints in cache operations
-- Monitor MemoryCache.Default statistics
-- Use performance profilers for memory analysis
-- Enable trace logging for lock operations (commented code in [CacheUtility.cs](mdc:CacheUtility.cs))
+- Enable logging: `services.AddCacheLogging()` (DI) or `Cache.ConfigureLogging(loggerFactory)` (non-DI), then set the `CacheUtility` source to `Debug` or `Trace`.
+- Inspect runtime state via `Cache.GetAllCacheMetadata()` and `Cache.GetPersistentCacheStatistics()`.
+- For populate de-duplication issues, log inside the populate method and assert it is called exactly once under N concurrent callers.
 
 ## Documentation Maintenance
 
 ### Keep Updated
-- API documentation in code comments
-- Usage examples in [README.md](mdc:README.md)
-- Release notes in project file
-- Package tags and description for discoverability
+- XML doc comments on the public surface in [Cache.cs](mdc:Cache.cs) and [CacheServiceExtensions.cs](mdc:CacheServiceExtensions.cs).
+- Usage examples and the API reference table in [README.md](mdc:README.md).
+- Per-version notes in [CHANGELOG.md](mdc:CHANGELOG.md) and `<PackageReleaseNotes>`.
+- This rule and the others under [.cursor/rules/](mdc:.cursor/rules) when the architecture changes (e.g. concurrency primitives, file layout, public API shape).
 
 ### Review Process
-- Test all documented examples
-- Verify code samples compile and work
-- Ensure documentation matches current API
-- Update version-specific information
-
+- All documented examples must compile against the current `Cache` API.
+- API reference tables must list every public overload that exists.
+- Version numbers in the README and `.csproj` must agree.

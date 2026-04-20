@@ -8,94 +8,109 @@ alwaysApply: false
 ## Core API Design Patterns
 
 ### Cache Key Management
-The Cache class uses internal key combination pattern from [CacheUtility.cs](mdc:CacheUtility.cs):
+The `Cache` class combines the group name and the user-provided key into a single internal key:
 ```csharp
-// Pattern: Combine group name with cache key
+// In Cache.cs
 cacheKey = string.Format("{0}_{1}", groupName, cacheKey);
 ```
+This combined key is what `MemoryCache.Default` actually sees. The original (un-prefixed) key is preserved on `CacheItem<T>.CacheKey` for metadata and group enumeration.
 
 ### Method Overloading Strategy
-The Cache class provides multiple overloads for flexibility:
-1. Basic usage with defaults: `Get<TData>(key, group, populateMethod)`
-2. With sliding expiration: `Get<TData>(key, group, slidingExpiration, populateMethod)`
-3. With absolute expiration: `Get<TData>(key, group, absoluteExpiration, populateMethod)`
-4. Full control: `Get<TData>(key, group, absoluteExpiration, slidingExpiration, priority, populateMethod)`
+The `Cache` class exposes parallel sync and async overload sets, each from minimal to fully-explicit:
+
+Synchronous (`Get<TData>`):
+1. Defaults: `Get<TData>(key, group, populateMethod, refresh = default)` (30-minute sliding)
+2. Sliding: `Get<TData>(key, group, slidingExpiration, populateMethod, refresh = default)`
+3. Absolute: `Get<TData>(key, group, absoluteExpiration, populateMethod, refresh = default)`
+4. Full control: `Get<TData>(key, group, absoluteExpiration, slidingExpiration, priority, populateMethod, removedCallback = null, refresh = default)`
+
+Asynchronous (`GetAsync<TData>` — added in 1.4.0):
+- Same four shapes as above, but `populateMethod` is `Func<Task<TData>>` and each overload accepts a trailing `CancellationToken cancellationToken = default`.
 
 ### Populate Method Pattern
-All Get methods use `Func<TData> populateMethod` for lazy loading:
-- Method is only called when item is not in cache or expired
-- Supports both synchronous and asynchronous operations
-- Return value is automatically cached with specified expiration
+- Sync populate: `Func<TData>` — invoked at most once per cache miss; concurrent callers wait on a shared `Lazy<object>`.
+- Async populate: `Func<Task<TData>>` — invoked at most once per cache miss; concurrent callers await the same `Task<object>`.
+- A failed populate (exception / faulted task) is **not** cached. The next call retries.
+- Cancellation on `GetAsync` only cancels the awaiting caller. Other waiters on the same in-flight populate continue to await the shared task.
 
 ### Group-Based Operations
-Cache groups enable bulk operations:
-- Items are organized by group names
-- Groups can have dependencies on other groups
-- Removing a group removes all its items and dependent groups
-- `GetAllByGroup()` retrieves all items from a specific group
+- Items are organized by group name. Group membership lives in `_groups` (a `ConcurrentDictionary<string, ConcurrentDictionary<string, byte>>`).
+- `GetAllByGroup` returns a `Dictionary<string, object>`; `GetAllByGroup<TData>` returns `Dictionary<string, TData>` and silently skips items whose stored type does not match `TData`.
+- `RemoveGroup(params string[])` removes all items in the listed groups *and* their dependents. It is **cycle-safe** — a dependency cycle (`A → B → A`) will not infinite-loop.
+- `SetDependencies(group, params dependents)` replaces (not appends to) the dependency list for `group`.
+
+### Peek Pattern
+- `TryGet<TData>(key, group, out value)` checks the in-memory cache only. It does **not** consult persistent storage and does **not** invoke any populate method. Returns `false` if missing or if the stored type is not assignable to `TData`.
 
 ## Extension Guidelines
 
 ### Adding New Cache Methods
-When adding new methods to the Cache class:
-1. Follow parameter validation pattern (null checks with ArgumentNullException)
-2. Use internal key combination for group/key pairing
-3. Implement proper locking using established patterns
-4. Add corresponding unit tests following [GetAllByGroupTests.cs](mdc:CacheUtility.Tests/GetAllByGroupTests.cs) patterns
+When adding new methods to the `Cache` class:
+1. Validate parameters at the entry point (`ArgumentNullException` for nulls, `nameof(...)` for parameter names).
+2. Use the established internal key combination (`groupName_cacheKey`).
+3. For new state, prefer `ConcurrentDictionary` over `Dictionary` + manual locking. Reach for `CacheLock` only when an operation must be globally serialized.
+4. For populate de-duplication, follow the existing `_inflightSync` (`Lazy<object>`) and `_inflightAsync` (`Task<object>`) patterns — never invoke a user populate callback while holding `CacheLock`.
+5. Keep public signatures backward-compatible. Soft-deprecate via `<remarks>` (with `<see cref>` to the preferred replacement) rather than `[Obsolete]` whenever possible.
+6. Add xUnit tests in `CacheUtility.Tests/` (see [NewApiTests.cs](mdc:CacheUtility.Tests/NewApiTests.cs) for the established style).
 
-### Cache Group Features
-When working with cache groups:
-- Always update `RegisteredGroups` dictionary when adding items
-- Handle group dependencies through `_dependencies` dictionary
-- Use recursive removal for dependent groups
-- Maintain thread safety during group operations
+### Cache Group Internals
+When working with groups inside `Cache.cs`:
+- Always update `_groups[groupName]` when registering or removing a key.
+- Use `_dependencies` (a `ConcurrentDictionary<string, string[]>`) for cascade-on-remove relationships. Remember `RemoveGroup` already handles cycle detection.
+- `RemoveByInternalKey(fullKey, knownGroup = null)` is the one canonical removal helper — call it instead of duplicating cleanup logic for in-flight populate state, group membership, and persistent files.
 
 ### Data Type Handling
-The cache supports any .NET type through generics:
-- Wrap cached items in `CacheItem<T>` internally
-- Support value types, reference types, and complex objects
-- Handle null values appropriately
-- Ensure serialization compatibility if needed
+- Values are wrapped in `Cache.CacheItem<TData>` (which implements internal `ICacheItem`).
+- Reflection is **not** used on hot paths. Anything you need from a `CacheItem<T>` of unknown `T` should be reachable via the `ICacheItem` interface (extend it if needed).
+- For persistent cache, values must be JSON-serializable via `System.Text.Json`. Strings and `byte[]` use a fast path that bypasses the serializer.
 
 ## Testing Patterns
 
-### Test Structure (from [GetAllByGroupTests.cs](mdc:CacheUtility.Tests/GetAllByGroupTests.cs))
+### Test Structure
+The test project has parallelization disabled assembly-wide (see [TestCollectionConfig.cs](mdc:CacheUtility.Tests/TestCollectionConfig.cs)) because `Cache` is static and tests mutate shared state. Per-test cleanup is still required:
+
 ```csharp
 public class FeatureTests : IDisposable
 {
     public FeatureTests()
     {
-        Cache.RemoveAll(); // Clean start
+        Cache.RemoveAll();
+        Cache.DisablePersistentCache();
     }
 
     public void Dispose()
     {
-        Cache.RemoveAll(); // Clean end
-        Cache.Dispose();
+        Cache.RemoveAll();
+        Cache.DisablePersistentCache();
     }
 }
 ```
 
 ### Test Scenarios to Cover
-- Valid input scenarios
-- Edge cases (empty groups, null parameters)
-- Data type variations
-- Thread safety scenarios
-- Group dependency behavior
-- Expiration handling
+- Happy path for every new overload (sync + async if applicable).
+- Concurrent populate (verify the populate method is invoked exactly once under N parallel callers).
+- Edge cases: null parameters, empty groups, type mismatches in `GetAllByGroup<T>` / `TryGet<T>`.
+- Expiration: absolute, sliding, and the `MaxSlidingExpiration` clamp.
+- Persistent cache: round-trip, atomic writes (no half-written files on simulated crash), orphaned `.cache` cleanup, group whitelist, sliding-touch throttle.
+- Dependency cascades, including cycles.
+- Background refresh: non-blocking, error-resilient, deduped.
 
 ## Integration Points
 
 ### System.Runtime.Caching Integration
-The Cache class wraps `MemoryCache.Default`:
-- Uses `CacheItemPolicy` for expiration settings
-- Handles `CacheItemPriority` appropriately
-- Manages cache item lifecycle through System.Runtime.Caching events
+The `Cache` class wraps `MemoryCache.Default`:
+- Uses `CacheItemPolicy` for expiration and priority.
+- `CacheItemPriority` is exposed on the full `Get` / `GetAsync` overloads.
+- `CacheEntryRemovedCallback` is forwarded so callers can react to removals.
+
+### Logging Integration
+- Always log via the `_logger` field (it is `volatile` and defaults to `NullLogger.Instance`).
+- Use structured logging with named placeholders (`{CacheKey}`, `{GroupName}`, `{MethodName}`).
+- Hot-path logs (cache hit) should use `LogTrace`; misses and lifecycle events use `LogDebug`; failures use `LogWarning` / `LogError`.
 
 ### Documentation Updates
 When adding features, update:
-- XML documentation in code
-- [README.md](mdc:README.md) with usage examples
-- [CacheUtility.csproj](mdc:CacheUtility.csproj) release notes
-- Package version and tags as needed
-
+- XML doc comments on the new public surface (`<summary>`, `<param>`, `<returns>`, `<remarks>` where useful).
+- [README.md](mdc:README.md) — feature list, usage section, API reference table.
+- [CHANGELOG.md](mdc:CHANGELOG.md) — a new entry under the next version.
+- `<Version>` and `<PackageReleaseNotes>` in [CacheUtility.csproj](mdc:CacheUtility.csproj).

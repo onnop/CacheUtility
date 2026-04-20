@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-04-19
+
+### Added
+- **`GetAsync<T>` overloads** mirroring the synchronous `Get` family. Async populate methods (`Func<Task<T>>`) are now supported with the same single-flight de-duplication semantics as the sync path. Optional `CancellationToken` parameter on the full overload.
+- **Generic `GetAllByGroup<T>(string groupName)`** that returns `Dictionary<string, T>` directly, skipping boxing and reflection. Items whose stored type does not match `T` are skipped.
+- **`TryGet<T>(string cacheKey, string groupName, out T value)`** — peek at the in-memory cache without invoking any populate method.
+- Internal `ICacheItem` interface that lets the cache infrastructure introspect cache items without reflection.
+
+### Changed (performance)
+- Replaced the global `CacheLock` and per-key `ReaderWriterLockSlim` registry with `ConcurrentDictionary` and `Lazy<T>`-based single-flight populate de-duplication. Reads no longer serialize on a global monitor; per-key allocations are gone.
+- Eliminated reflection from hot paths (`Remove`, `GetAllByGroup`, `GetAllCacheMetadata`) by routing through the new `ICacheItem` interface.
+- `EstimateObjectSize` is now computed once per populate/refresh and cached on the cache item, instead of re-serializing the value on every metadata read.
+- Composite key construction switched from `string.Format` to `string.Concat`.
+- `GetAllByGroup` now uses the cache item's stored `CacheKey` instead of substring-parsing the full key, removing ambiguity when group names contain underscores.
+- `Remove(List<string>, string)` now correctly scopes its match to the specified group (was previously broken).
+- `RemoveAll` now snapshots all keys then removes (was O(N²) loop).
+
+### Fixed (correctness)
+- **`CacheItem<T>.RefreshLock`** now returns the same monitor object across all calls. Previously, if the field was ever uninitialized (e.g. after deserialization), every call returned a brand-new `object`, which made the lock useless and allowed concurrent background refreshes for the same key.
+- **Persistent sliding expiration** now actually slides: `LastAccessTime` is updated on read (not only on save), throttled to ~10% of the sliding window to bound write amplification.
+- **`RemoveGroup` is now cycle-safe** — a circular dependency between groups (e.g. A → B → A) used to cause a `StackOverflowException`. Each group is processed at most once per invocation.
+- **Group bookkeeping leak fixed**: when `MemoryCache` evicts an item on its own (memory pressure, expiration), the entry is now removed from the owning group's subkey set via the removal callback.
+- **`SetDependencies`** is now thread-safe and idempotent. Calling it twice for the same group replaces the previous dependencies (used to throw `ArgumentException`).
+- **`_logger` field** is now `volatile` for safe publication across threads when `ConfigureLogging` is called from a non-startup thread.
+
+### Fixed (persistent cache)
+- **Atomic file writes**: persistent cache writes now go to `<path>.tmp` and atomically rename to the final path. A crash mid-write no longer corrupts the cache file.
+- **Faster cleanup pass**: `CleanupExpiredPersistentFiles` now uses the file's `LastWriteTime` as a cheap pre-filter and skips parsing files younger than 1 minute. Cleanup also removes orphaned `.cache` files (those without a sibling `.meta`, e.g. crash mid-write residue).
+- Persistent statistics correctly count both `.cache` and `.meta` files when determining largest/smallest sizes.
+
+### Notes
+- Public API surface is fully backward-compatible: no methods removed, no signatures changed. New methods are additive.
+- All 48 tests (20 existing + 28 new) pass.
+
 ## [1.3.5] - 2026-03-01
 
 ### Changed

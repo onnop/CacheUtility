@@ -8,54 +8,58 @@ alwaysApply: false
 ## C# Style Guidelines
 
 ### Naming Conventions
-- Follow established patterns in [CacheUtility.cs](mdc:CacheUtility.cs):
-  - Private static fields use camelCase with underscore prefix: `_dependencies`, `CacheLock`
-  - Private fields use PascalCase: `RegisteredKeys`, `RegisteredGroups`
-  - Public methods use PascalCase: `Get`, `Remove`, `RemoveGroup`
-  - Generic type parameters use T prefix: `TData`
-  - Parameters use camelCase: `cacheKey`, `groupName`, `populateMethod`
+Follow the patterns established in [Cache.cs](mdc:Cache.cs):
+- Private static fields use camelCase with an underscore prefix: `_dependencies`, `_groups`, `_inflightSync`, `_inflightAsync`, `_logger`, `_persistentOptions`.
+- Globally-shared lock objects use PascalCase: `CacheLock`.
+- Public methods use PascalCase: `Get`, `GetAsync`, `Remove`, `RemoveGroup`, `TryGet`, `GetAllByGroup`.
+- Generic type parameters use the `T` prefix; the data type parameter is `TData`.
+- Parameters use camelCase: `cacheKey`, `groupName`, `populateMethod`, `cancellationToken`.
 
 ### Method Documentation
-- All public methods must have XML documentation comments
-- Include `<summary>`, `<param>`, and `<returns>` tags
-- Follow the documentation style established in the main Cache class
-- Document exceptions with `<exception>` tags
+- All public methods must have XML documentation comments with `<summary>`, `<param>`, `<returns>`, and (where relevant) `<exception>` tags.
+- For methods that have a recommended replacement (e.g. sync overloads vs. their async siblings), add a `<remarks>` block with `<see cref="..."/>` pointing at the preferred API. This surfaces the suggestion in IntelliSense without producing build warnings.
+- Keep XML doc examples small and self-contained.
 
 ### Error Handling
-- Validate parameters at method entry points:
-  - Use `ArgumentNullException` for null parameters
-  - Use descriptive parameter names in exceptions: `nameof(cacheKey)`
-- Follow the validation pattern from existing Get methods
+- Validate every parameter at method entry (`ArgumentNullException` for nulls, `ArgumentException` for invalid values).
+- Always use `nameof(parameter)` rather than string literals when constructing exceptions.
+- A failed populate (sync throw or async fault) must NOT be cached. Clean up in-flight populate state before rethrowing.
 
 ### Thread Safety
-- All operations must be thread-safe
-- Use the established locking patterns:
-  - `CacheLock` for cache structure modifications
-  - `ReaderWriterLockSlim` for per-key operations
-  - Always use try/finally blocks with locks
+- All operations must be thread-safe. The current concurrency model is:
+  - `ConcurrentDictionary<string, ...>` for `_groups`, `_dependencies`, `_inflightSync`, `_inflightAsync` — lock-free reads.
+  - `Lazy<object>` for synchronous populate de-duplication (one populate run, N waiters).
+  - Shared `Task<object>` for asynchronous populate de-duplication.
+  - A single global `lock (CacheLock)` for operations that must be globally serialized: enabling/disabling persistent cache, bulk removes, dependency cycle resolution.
+  - Per-item refresh locks via `LazyInitializer.EnsureInitialized` on `Cache.CacheItem<T>.RefreshLock`.
+- Never invoke a user-supplied populate callback while holding `CacheLock` — that is how reentrancy deadlocks happen.
+- Do not reintroduce `ReaderWriterLockSlim` — it was removed in v1.4.0 in favor of the model above.
 
 ### Generic Methods
-- Use meaningful generic constraints where applicable
-- Follow the pattern of `TData` for data types
-- Ensure generic methods work with all .NET types including value types and reference types
+- Use `TData` for the data type parameter; do not constrain it unless the new method genuinely requires a constraint.
+- Generic methods must work for value types, reference types, nullables, and collections. Box only when explicitly returning the non-generic public API (e.g. `GetAllByGroup` without `<T>`).
 
 ## Project Structure Standards
 
 ### Test Organization
-- Tests should be in [CacheUtility.Tests/](mdc:CacheUtility.Tests) directory
-- Each test class should implement `IDisposable` for cleanup
-- Use `Cache.RemoveAll()` in setup and teardown like in [GetAllByGroupTests.cs](mdc:CacheUtility.Tests/GetAllByGroupTests.cs)
-- Follow Arrange-Act-Assert pattern
+- Tests live in [CacheUtility.Tests/](mdc:CacheUtility.Tests).
+- The test assembly disables xUnit parallelization via [TestCollectionConfig.cs](mdc:CacheUtility.Tests/TestCollectionConfig.cs); do not re-enable it without first making `Cache` non-static.
+- Each test class implements `IDisposable` and calls `Cache.RemoveAll()` (and `Cache.DisablePersistentCache()` if it touched persistence) in both the constructor and `Dispose`.
+- Prefer narrow, scenario-named files (`BugFixTests.cs`, `NewApiTests.cs`, `PersistentCacheHardeningTests.cs`) over piling everything into [CacheTests.cs](mdc:CacheUtility.Tests/CacheTests.cs).
+- Follow Arrange-Act-Assert.
 
 ### NuGet Package Configuration
-- Update version in [CacheUtility.csproj](mdc:CacheUtility.csproj) for releases
-- Maintain comprehensive PackageReleaseNotes
-- Keep PackageTags relevant and searchable
-- Update documentation references when making API changes
+When releasing a new version:
+- Update `<Version>` in [CacheUtility.csproj](mdc:CacheUtility.csproj).
+- Append a full entry to `<PackageReleaseNotes>` (don't replace older entries silently).
+- Add the matching section to [CHANGELOG.md](mdc:CHANGELOG.md).
+- Bump the `Version=` referenced in the [README.md](mdc:README.md) PackageReference example.
+- Review `<PackageTags>` if new top-level capabilities were added.
 
 ## Performance Considerations
-- Minimize lock contention by keeping critical sections small
-- Use read locks where possible before write locks
-- Cache internal key combinations to avoid string concatenation in hot paths
-- Consider memory usage when implementing new cache features
-
+- Hot path = anything called per `Get` / `GetAsync` / `TryGet`. It must be allocation-light and lock-free.
+- Avoid reflection on hot paths. The internal `ICacheItem` interface exists precisely so metadata enumeration and size estimation don't need `MakeGenericType` / `Activator.CreateInstance` / `MethodInfo.Invoke`.
+- Cache derived values on `CacheItem<T>` rather than recomputing them (e.g. `CachedEstimatedSize` after the first `RecomputeEstimatedSize()` call).
+- For persistent cache writes, use the `WriteFileAtomic(path, content)` helper (`.tmp` + `File.Move`). Never write directly to the final `.cache` path.
+- Throttle sliding-expiration "touch" writes to persistent storage (currently min 1 minute between touches per item).
+- When in doubt, micro-benchmark before and after using `BenchmarkDotNet`.

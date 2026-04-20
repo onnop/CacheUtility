@@ -1,5 +1,6 @@
 using System;
 using System.Collections;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -17,11 +18,31 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace CacheUtility
 {
     /// <summary>
+    /// Type-erased view of a <see cref="Cache.CacheItem{T}"/> used to avoid reflection in hot paths.
+    /// </summary>
+    internal interface ICacheItem : IDisposable
+    {
+        object ItemBoxed { get; }
+        string CacheKey { get; }
+        string GroupName { get; }
+        DateTime LastRefreshTime { get; }
+        TimeSpan RefreshInterval { get; }
+        bool IsRefreshing { get; }
+        DateTime RefreshStartTime { get; }
+        DateTime LastRefreshAttempt { get; }
+        DateTime AbsoluteExpiration { get; }
+        TimeSpan SlidingExpiration { get; }
+        string PopulateMethodName { get; }
+        long? CachedEstimatedSize { get; }
+        Type DataType { get; }
+    }
+
+    /// <summary>
     /// Threadsafe generic System.Runtime.Caching wrapper. Simplified System.Runtime.Caching cache access and supports easy caching patterns.
     /// </summary>
     public abstract class Cache
     {
-        private static ILogger _logger = NullLogger.Instance;
+        private static volatile ILogger _logger = NullLogger.Instance;
 
         /// <summary>
         /// Configures logging for CacheUtility. Call once at application startup.
@@ -33,37 +54,48 @@ namespace CacheUtility
         }
 
         /// <summary>
-        /// Groups that depend on each other when removing from the cache
+        /// Group name -> dependent group names that should also be removed when the group is removed.
+        /// Stored as immutable arrays so reads are lock-free.
         /// </summary>
-        private static readonly Dictionary<string, List<string>> _dependencies = new Dictionary<string, List<string>>();
+        private static readonly ConcurrentDictionary<string, string[]> _dependencies =
+            new ConcurrentDictionary<string, string[]>(StringComparer.Ordinal);
 
         /// <summary>
-        /// The cache lock
+        /// Group name -> set of full cache keys that belong to it (value byte is unused; this is a concurrent set).
         /// </summary>
-        private static readonly object CacheLock = new();
+        private static readonly ConcurrentDictionary<string, ConcurrentDictionary<string, byte>> _groups =
+            new ConcurrentDictionary<string, ConcurrentDictionary<string, byte>>(StringComparer.Ordinal);
 
         /// <summary>
-        /// The inregistered keys
+        /// In-flight synchronous populate operations keyed by full cache key.
+        /// Populated transiently while a populate is running, then removed.
         /// </summary>
-        private static readonly Dictionary<string, ReaderWriterLockSlim> RegisteredKeys = new();
+        private static readonly ConcurrentDictionary<string, Lazy<object>> _inflightSync =
+            new ConcurrentDictionary<string, Lazy<object>>(StringComparer.Ordinal);
 
         /// <summary>
-        /// The registered groups
+        /// In-flight asynchronous populate operations keyed by full cache key.
         /// </summary>
-        private static readonly Dictionary<string, CacheGroup> RegisteredGroups = new();
+        private static readonly ConcurrentDictionary<string, Task<object>> _inflightAsync =
+            new ConcurrentDictionary<string, Task<object>>(StringComparer.Ordinal);
 
         /// <summary>
-        /// Persistent cache configuration options
+        /// Persistent cache configuration options. Volatile for safe publication across threads.
         /// </summary>
-        private static PersistentCacheOptions _persistentOptions = null;
+        private static volatile PersistentCacheOptions _persistentOptions;
 
         /// <summary>
-        /// Timer for cleaning up expired persistent cache files
+        /// Timer for cleaning up expired persistent cache files.
         /// </summary>
-        private static Timer _persistentCleanupTimer = null;
+        private static Timer _persistentCleanupTimer;
 
         /// <summary>
-        /// JSON serialization options for persistent cache files
+        /// Lock guarding persistent cache enable/disable transitions.
+        /// </summary>
+        private static readonly object _persistentLifecycleLock = new object();
+
+        /// <summary>
+        /// JSON serialization options for persistent cache files.
         /// </summary>
         private static readonly JsonSerializerOptions CacheJsonOptions = new JsonSerializerOptions
         {
@@ -73,15 +105,22 @@ namespace CacheUtility
         };
 
         /// <summary>
+        /// Maximum sliding expiration (one year minus a minute, matching System.Runtime.Caching's ceiling).
+        /// </summary>
+        private static readonly TimeSpan MaxSlidingExpiration = TimeSpan.FromDays(365) - TimeSpan.FromMinutes(1);
+
+        // =====================================================================
+        // Public Get overloads
+        // =====================================================================
+
+        /// <summary>
         /// Retrieve an object from the runtime cache. The populate method will fill the cache if the object is not yet created or expired.
         /// </summary>
-        /// <typeparam name="TData">Cached object type</typeparam>
-        /// <param name="cacheKey">Cache key</param>
-        /// <param name="groupName">The name of the cache group</param>
-        /// <param name="slidingExpiration">Sliding expiration duration</param>
-        /// <param name="populateMethod">Populate method which is called when the item does not exist in the cache</param>
-        /// <param name="refresh">Refresh interval to automatically update the cached data using the populate method</param>
-        /// <returns>Cached or newly created object</returns>
+        /// <remarks>
+        /// If your <paramref name="populateMethod"/> performs I/O (database, HTTP, file access),
+        /// prefer <see cref="GetAsync{TData}(string, string, TimeSpan, Func{Task{TData}}, TimeSpan, CancellationToken)"/>
+        /// to avoid blocking the calling thread.
+        /// </remarks>
         public static TData Get<TData>(string cacheKey, string groupName, TimeSpan slidingExpiration, Func<TData> populateMethod, TimeSpan refresh = default)
         {
             if (slidingExpiration == TimeSpan.Zero) throw new ArgumentException("TimeSpan.Zero is not allowed for sliding expiration", nameof(slidingExpiration));
@@ -89,29 +128,26 @@ namespace CacheUtility
         }
 
         /// <summary>
-        /// Gets the specified cache key.
+        /// Gets the specified cache key with a default 30-minute sliding expiration.
         /// </summary>
-        /// <typeparam name="TData">The type of the T data.</typeparam>
-        /// <param name="cacheKey">The cache key.</param>
-        /// <param name="groupName">Name of the group.</param>
-        /// <param name="populateMethod">The populate method.</param>
-        /// <param name="refresh">Refresh interval to automatically update the cached data using the populate method</param>
-        /// <returns>``0.</returns>
+        /// <remarks>
+        /// If your <paramref name="populateMethod"/> performs I/O (database, HTTP, file access),
+        /// prefer <see cref="GetAsync{TData}(string, string, Func{Task{TData}}, TimeSpan, CancellationToken)"/>
+        /// to avoid blocking the calling thread.
+        /// </remarks>
         public static TData Get<TData>(string cacheKey, string groupName, Func<TData> populateMethod, TimeSpan refresh = default)
         {
             return Get(cacheKey, groupName, TimeSpan.FromMinutes(30), populateMethod, refresh);
         }
 
         /// <summary>
-        /// Retrieve an object from the runtime cache. The populate method will fill the cache if the object is not yet created or expired.
+        /// Retrieve an object from the runtime cache using an absolute expiration date.
         /// </summary>
-        /// <typeparam name="TData">Cached object type</typeparam>
-        /// <param name="cacheKey">Cache key</param>
-        /// <param name="groupName">The name of the cache group</param>
-        /// <param name="absoluteExpiration">Absolute expiration date</param>
-        /// <param name="populateMethod">Populate method which is called when the item does not exist in the cache</param>
-        /// <param name="refresh">Refresh interval to automatically update the cached data using the populate method</param>
-        /// <returns>Cached or newly created object</returns>
+        /// <remarks>
+        /// If your <paramref name="populateMethod"/> performs I/O (database, HTTP, file access),
+        /// prefer <see cref="GetAsync{TData}(string, string, DateTime, Func{Task{TData}}, TimeSpan, CancellationToken)"/>
+        /// to avoid blocking the calling thread.
+        /// </remarks>
         public static TData Get<TData>(string cacheKey, string groupName, DateTime absoluteExpiration, Func<TData> populateMethod, TimeSpan refresh = default)
         {
             return Get(cacheKey, groupName, absoluteExpiration, TimeSpan.Zero, CacheItemPriority.Default, populateMethod, null, refresh);
@@ -120,146 +156,158 @@ namespace CacheUtility
         /// <summary>
         /// Retrieve an object from the runtime cache. The populate method will fill the cache if the object is not yet created or expired.
         /// </summary>
-        /// <typeparam name="TData">Cached object type</typeparam>
-        /// <param name="cacheKey">Cache key</param>
-        /// <param name="groupName">The name of the cache group</param>
-        /// <param name="absoluteExpiration">Absolute expiration date</param>
-        /// <param name="slidingExpiration">Sliding expiration duration. If you are using an absolute expiration date, this has to be set to NoSlidingExpiration</param>
-        /// <param name="priority">Caching priority</param>
-        /// <param name="populateMethod">Populate method which is called when the item does not exist in the cache</param>
-        /// <param name="removedCallback">Optional callback method that is called when the cache item is removed</param>
-        /// <param name="refresh">Refresh interval to automatically update the cached data using the populate method</param>
-        /// <returns>Cached or newly created object</returns>
+        /// <remarks>
+        /// If your <paramref name="populateMethod"/> performs I/O (database, HTTP, file access),
+        /// prefer <see cref="GetAsync{TData}(string, string, DateTime, TimeSpan, CacheItemPriority, Func{Task{TData}}, CacheEntryRemovedCallback, TimeSpan, CancellationToken)"/>
+        /// to avoid blocking the calling thread.
+        /// </remarks>
         public static TData Get<TData>(string cacheKey, string groupName, DateTime absoluteExpiration, TimeSpan slidingExpiration, CacheItemPriority priority, Func<TData> populateMethod, CacheEntryRemovedCallback removedCallback = null, TimeSpan refresh = default)
         {
-            // Validate parameters
-            if (string.IsNullOrEmpty(cacheKey)) throw new ArgumentNullException(nameof(cacheKey));
-            if (string.IsNullOrEmpty(groupName)) throw new ArgumentNullException(nameof(groupName));
-            if (populateMethod == null) throw new ArgumentNullException(nameof(populateMethod));
+            ValidateGetArgs(cacheKey, groupName, populateMethod);
+            refresh = NormalizeRefresh(refresh);
 
-            // Edge case handling: if refresh interval is too small, disable it
-            if (refresh > TimeSpan.Zero && refresh < TimeSpan.FromSeconds(1))
+            var fullKey = BuildFullKey(groupName, cacheKey);
+
+            // Fast path: existing item already in MemoryCache. No locks taken.
+            if (MemoryCache.Default.Get(fullKey) is CacheItem<TData> existing)
             {
-                refresh = TimeSpan.Zero; // Disable refresh for very small intervals
+                if (_logger.IsEnabled(LogLevel.Trace))
+                    _logger.LogTrace("Cache hit: {CacheKey} in group {GroupName}", cacheKey, groupName);
+
+                MaybeStartBackgroundRefresh(existing, fullKey, refresh);
+                return existing.Item;
             }
 
-            // Edge case handling: if refresh interval is longer than sliding expiration, 
-            // the item might expire before refresh happens. This is allowed but logged.
-            if (refresh > TimeSpan.Zero && slidingExpiration > TimeSpan.Zero && refresh > slidingExpiration)
+            return LoadCacheItemSynchronously(fullKey, cacheKey, groupName, absoluteExpiration, slidingExpiration, priority, populateMethod, removedCallback, refresh);
+        }
+
+        // =====================================================================
+        // Public GetAsync overloads (NEW in v1.4)
+        // =====================================================================
+
+        /// <summary>
+        /// Asynchronously retrieve an object from the cache, awaiting an async populate method on cache miss.
+        /// Concurrent callers for the same key share a single populate task.
+        /// </summary>
+        public static Task<TData> GetAsync<TData>(string cacheKey, string groupName, TimeSpan slidingExpiration, Func<Task<TData>> populateMethod, TimeSpan refresh = default, CancellationToken cancellationToken = default)
+        {
+            if (slidingExpiration == TimeSpan.Zero) throw new ArgumentException("TimeSpan.Zero is not allowed for sliding expiration", nameof(slidingExpiration));
+            return GetAsync(cacheKey, groupName, DateTime.MaxValue, slidingExpiration, CacheItemPriority.Default, populateMethod, null, refresh, cancellationToken);
+        }
+
+        /// <summary>
+        /// Asynchronously retrieve an object from the cache with a default 30-minute sliding expiration.
+        /// </summary>
+        public static Task<TData> GetAsync<TData>(string cacheKey, string groupName, Func<Task<TData>> populateMethod, TimeSpan refresh = default, CancellationToken cancellationToken = default)
+        {
+            return GetAsync(cacheKey, groupName, TimeSpan.FromMinutes(30), populateMethod, refresh, cancellationToken);
+        }
+
+        /// <summary>
+        /// Asynchronously retrieve an object from the cache using an absolute expiration date.
+        /// </summary>
+        public static Task<TData> GetAsync<TData>(string cacheKey, string groupName, DateTime absoluteExpiration, Func<Task<TData>> populateMethod, TimeSpan refresh = default, CancellationToken cancellationToken = default)
+        {
+            return GetAsync(cacheKey, groupName, absoluteExpiration, TimeSpan.Zero, CacheItemPriority.Default, populateMethod, null, refresh, cancellationToken);
+        }
+
+        /// <summary>
+        /// Asynchronously retrieve an object from the cache. Full overload mirroring the synchronous Get.
+        /// </summary>
+        public static async Task<TData> GetAsync<TData>(string cacheKey, string groupName, DateTime absoluteExpiration, TimeSpan slidingExpiration, CacheItemPriority priority, Func<Task<TData>> populateMethod, CacheEntryRemovedCallback removedCallback = null, TimeSpan refresh = default, CancellationToken cancellationToken = default)
+        {
+            ValidateGetArgsAsync(cacheKey, groupName, populateMethod);
+            refresh = NormalizeRefresh(refresh);
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var fullKey = BuildFullKey(groupName, cacheKey);
+
+            if (MemoryCache.Default.Get(fullKey) is CacheItem<TData> existing)
             {
-                // Allow this configuration but be aware that the cache item might expire 
-                // before the refresh timer fires, causing the timer to become orphaned.
-                // The timer cleanup in RefreshCacheItem will handle this case.
+                if (_logger.IsEnabled(LogLevel.Trace))
+                    _logger.LogTrace("Cache hit: {CacheKey} in group {GroupName}", cacheKey, groupName);
+
+                MaybeStartBackgroundRefresh(existing, fullKey, refresh);
+                return existing.Item;
             }
 
-            // Combine cachekey with the groupkey to create a unique key
-            var originalCacheKey = cacheKey;
-            cacheKey = string.Format("{0}_{1}", groupName, cacheKey);
-
-            // Read unlocked
-            var item = MemoryCache.Default.Get(cacheKey) as CacheItem<TData>;
-
-            // If item doesn't exist, we must load it synchronously (no choice)
-            if (item == null)
-            {
-                if (_logger.IsEnabled(LogLevel.Debug))
-                {
-                    var methodInfo = populateMethod.Method;
-                    var methodName = methodInfo.DeclaringType != null 
-                        ? $"{methodInfo.DeclaringType.Name}.{methodInfo.Name}" 
-                        : methodInfo.Name;
-                    _logger.LogDebug("Cache miss, loading data: {CacheKey} in group {GroupName} using {MethodName}", originalCacheKey, groupName, methodName);
-                }
-                return LoadCacheItemSynchronously(cacheKey, originalCacheKey, groupName, absoluteExpiration, slidingExpiration, priority, populateMethod, removedCallback, refresh);
-            }
-
-            if (_logger.IsEnabled(LogLevel.Trace))
-                _logger.LogTrace("Cache hit: {CacheKey} in group {GroupName}", originalCacheKey, groupName);
-
-            // Item exists - check if refresh is needed
-            var needsRefresh = false;
-            if (refresh > TimeSpan.Zero)
-            {
-                var timeSinceLastRefresh = DateTime.Now - item.LastRefreshTime;
-                needsRefresh = timeSinceLastRefresh >= refresh;
-            }
-
-            // If refresh is needed, start background refresh but return existing data immediately
-            if (needsRefresh && !item.IsRefreshing)
-            {
-                StartBackgroundRefresh(item, cacheKey);
-            }
-
-            // Always return existing data immediately (even if stale)
+            var item = await LoadCacheItemAsync(fullKey, cacheKey, groupName, absoluteExpiration, slidingExpiration, priority, populateMethod, removedCallback, refresh, cancellationToken).ConfigureAwait(false);
             return item.Item;
         }
+
+        // =====================================================================
+        // Public TryGet (NEW in v1.4) - peek without populating
+        // =====================================================================
+
+        /// <summary>
+        /// Try to retrieve an item from the cache without invoking any populate method.
+        /// Returns true if the item is present in the in-memory cache, false otherwise.
+        /// Does not check persistent storage.
+        /// </summary>
+        public static bool TryGet<TData>(string cacheKey, string groupName, out TData value)
+        {
+            if (string.IsNullOrEmpty(cacheKey)) throw new ArgumentNullException(nameof(cacheKey));
+            if (string.IsNullOrEmpty(groupName)) throw new ArgumentNullException(nameof(groupName));
+
+            var fullKey = BuildFullKey(groupName, cacheKey);
+            if (MemoryCache.Default.Get(fullKey) is CacheItem<TData> existing)
+            {
+                value = existing.Item;
+                return true;
+            }
+            value = default;
+            return false;
+        }
+
+        // =====================================================================
+        // Remove API
+        // =====================================================================
 
         /// <summary>
         /// Remove a key from the cache.
         /// </summary>
-        /// <param name="cacheKey">Cache key</param>
-        /// <param name="groupName">Name of the cache group.</param>
         public static void Remove(string cacheKey, string groupName)
         {
             if (_logger.IsEnabled(LogLevel.Debug))
                 _logger.LogDebug("Removing cache key: {CacheKey} from group {GroupName}", cacheKey, groupName);
 
-            // Combine cachekey with the groupkey to create a unique key
-            cacheKey = string.Format("{0}_{1}", groupName, cacheKey);
-
-            RemoveByInternalKey(cacheKey);
+            var fullKey = BuildFullKey(groupName, cacheKey);
+            RemoveByInternalKey(fullKey, knownGroup: groupName);
         }
 
         /// <summary>
-        /// Removes the by internal key.
+        /// Remove every key in the specified group whose original (un-prefixed) key contains all of the supplied snippets.
         /// </summary>
-        /// <param name="cacheKey">The cache key.</param>
-        private static void RemoveByInternalKey(string cacheKey)
-        {
-            lock (CacheLock)
-            {
-                // Get the cache item to dispose any timers
-                var cacheItem = MemoryCache.Default.Get(cacheKey);
-                if (cacheItem != null && cacheItem.GetType().IsGenericType &&
-                    cacheItem.GetType().GetGenericTypeDefinition() == typeof(CacheItem<>))
-                {
-                    // Use reflection to call Dispose method
-                    var disposeMethod = cacheItem.GetType().GetMethod("Dispose");
-                    disposeMethod?.Invoke(cacheItem, null);
-                }
-
-                // Remove from persistent cache if enabled
-                RemoveFromPersistentCache(cacheKey);
-
-                RegisteredKeys.Remove(cacheKey);
-                MemoryCache.Default.Remove(cacheKey);
-            }
-        }
-
-
-        /// <summary>
-        /// Remove a key from the cache that contains ALL snippets in <paramref name="cacheKeys" />.
-        /// The key must contain all the values from the cacheKey param.
-        /// </summary>
-        /// <param name="cacheKeys">Cache keys</param>
-        /// <param name="groupName">Name of the group.</param>
         public static void Remove(List<string> cacheKeys, string groupName)
         {
-            var cacheKeyFQN = new List<string>();
+            if (cacheKeys == null) throw new ArgumentNullException(nameof(cacheKeys));
+            if (string.IsNullOrEmpty(groupName)) throw new ArgumentNullException(nameof(groupName));
 
-            foreach (var key in RegisteredKeys.Keys.ToList())
+            if (!_groups.TryGetValue(groupName, out var subkeys)) return;
+
+            var prefix = groupName + "_";
+            var matched = new List<string>();
+            foreach (var fullKey in subkeys.Keys)
             {
-                var add = true;
-                var key1 = key;
-                cacheKeys.ForEach(s => add = add && key1.Contains(s));
-                if (add)
+                var originalKey = fullKey.StartsWith(prefix, StringComparison.Ordinal)
+                    ? fullKey.Substring(prefix.Length)
+                    : fullKey;
+
+                bool match = true;
+                for (int i = 0; i < cacheKeys.Count; i++)
                 {
-                    cacheKeyFQN.Add(key);
+                    if (!originalKey.Contains(cacheKeys[i]))
+                    {
+                        match = false;
+                        break;
+                    }
                 }
+                if (match) matched.Add(fullKey);
             }
-            foreach (var key in cacheKeyFQN)
+
+            for (int i = 0; i < matched.Count; i++)
             {
-                Remove(key, groupName);
+                RemoveByInternalKey(matched[i], knownGroup: groupName);
             }
         }
 
@@ -269,15 +317,28 @@ namespace CacheUtility
         public static void RemoveAll()
         {
             if (_logger.IsEnabled(LogLevel.Debug))
-                _logger.LogDebug("Removing all cached items ({Count} keys registered)", RegisteredKeys.Count);
+                _logger.LogDebug("Removing all cached items ({GroupCount} groups)", _groups.Count);
 
-            lock (CacheLock)
+            // Snapshot all full keys then remove. Safe with concurrent mutation.
+            var allKeys = new List<(string fullKey, string group)>();
+            foreach (var kvp in _groups)
             {
-                // Cannot do ForEach, since we are modifying the collection
-                while (RegisteredKeys.Count > 0)
+                foreach (var key in kvp.Value.Keys)
                 {
-                    RemoveByInternalKey(RegisteredKeys.Keys.First());
+                    allKeys.Add((key, kvp.Key));
                 }
+            }
+
+            for (int i = 0; i < allKeys.Count; i++)
+            {
+                RemoveByInternalKey(allKeys[i].fullKey, knownGroup: allKeys[i].group);
+            }
+
+            // Clear any empty group entries that may remain.
+            foreach (var kvp in _groups)
+            {
+                if (kvp.Value.IsEmpty)
+                    _groups.TryRemove(kvp.Key, out _);
             }
         }
 
@@ -287,127 +348,125 @@ namespace CacheUtility
         /// </summary>
         internal static void RemoveAllFromMemoryOnly()
         {
-            lock (CacheLock)
+            var allKeys = new List<(string fullKey, string group)>();
+            foreach (var kvp in _groups)
             {
-                // Dispose all cache items but don't remove persistent files
-                foreach (var key in RegisteredKeys.Keys.ToList())
+                foreach (var key in kvp.Value.Keys)
                 {
-                    // Get the cache item to dispose any timers
-                    var cacheItem = MemoryCache.Default.Get(key);
-                    if (cacheItem != null && cacheItem.GetType().IsGenericType &&
-                        cacheItem.GetType().GetGenericTypeDefinition() == typeof(CacheItem<>))
-                    {
-                        // Use reflection to call Dispose method
-                        var disposeMethod = cacheItem.GetType().GetMethod("Dispose");
-                        disposeMethod?.Invoke(cacheItem, null);
-                    }
-
-                    // Remove from memory cache and registered keys, but not persistent storage
-                    RegisteredKeys.Remove(key);
-                    MemoryCache.Default.Remove(key);
+                    allKeys.Add((key, kvp.Key));
                 }
-
-                // Clear registered groups
-                RegisteredGroups.Clear();
             }
+
+            foreach (var (fullKey, _) in allKeys)
+            {
+                if (MemoryCache.Default.Get(fullKey) is ICacheItem item)
+                {
+                    item.Dispose();
+                }
+                MemoryCache.Default.Remove(fullKey);
+                _inflightSync.TryRemove(fullKey, out _);
+                _inflightAsync.TryRemove(fullKey, out _);
+            }
+
+            _groups.Clear();
         }
 
         /// <summary>
-        /// Clear all CacheItems that were added by this cache.
-        /// Except the CacheItems in the groups specified.
+        /// Clear all CacheItems except those in the supplied groups.
         /// </summary>
-        /// <param name="excludedGroupNames">The excluded group names.</param>
         public static void RemoveAllButThese(List<string> excludedGroupNames)
         {
-            lock (CacheLock)
+            if (excludedGroupNames == null) throw new ArgumentNullException(nameof(excludedGroupNames));
+            var excluded = new HashSet<string>(excludedGroupNames, StringComparer.Ordinal);
+
+            foreach (var kvp in _groups)
             {
-                foreach (var pair in RegisteredGroups.Where(registeredGroup => !excludedGroupNames.Contains(registeredGroup.Key)).ToList())
+                if (excluded.Contains(kvp.Key)) continue;
+
+                var fullKeys = kvp.Value.Keys.ToArray();
+                for (int i = 0; i < fullKeys.Length; i++)
                 {
-                    foreach (var subkey in pair.Value.SubKeys)
-                    {
-                        RemoveByInternalKey(subkey);
-                    }
-                    RegisteredGroups.Remove(pair.Key);
+                    RemoveByInternalKey(fullKeys[i], knownGroup: kvp.Key);
                 }
+                _groups.TryRemove(kvp.Key, out _);
             }
         }
 
         /// <summary>
-        /// Removes an entire group from the cache.
+        /// Removes one or more entire groups from the cache, including any dependent groups.
+        /// Cycle-safe: each group is processed at most once per invocation.
         /// </summary>
-        /// <param name="groupName">Cache group name</param>
         public static void RemoveGroup(params string[] groupNames)
         {
-            foreach (var groupName in groupNames)
+            if (groupNames == null || groupNames.Length == 0) return;
+
+            var visited = new HashSet<string>(StringComparer.Ordinal);
+            for (int i = 0; i < groupNames.Length; i++)
             {
-                if (!RegisteredGroups.TryGetValue(groupName, out var group))
-                {
-                    if (_logger.IsEnabled(LogLevel.Debug))
-                        _logger.LogDebug("RemoveGroup: group {GroupName} not found, skipping", groupName);
-                    return;
-                }
+                RemoveGroupInternal(groupNames[i], visited);
+            }
+        }
 
+        private static void RemoveGroupInternal(string groupName, HashSet<string> visited)
+        {
+            if (groupName == null) return;
+            if (!visited.Add(groupName)) return;
+
+            if (!_groups.TryRemove(groupName, out var subkeys))
+            {
                 if (_logger.IsEnabled(LogLevel.Debug))
-                    _logger.LogDebug("Removing cache group {GroupName} ({KeyCount} keys)", groupName, group.SubKeys.Count);
+                    _logger.LogDebug("RemoveGroup: group {GroupName} not found, skipping", groupName);
+            }
+            else
+            {
+                if (_logger.IsEnabled(LogLevel.Debug))
+                    _logger.LogDebug("Removing cache group {GroupName} ({KeyCount} keys)", groupName, subkeys.Count);
 
-                var keys = new List<string>();
-                lock (CacheLock)
+                foreach (var fullKey in subkeys.Keys)
                 {
-                    for (var i = 0; i < group.SubKeys.Count; i++)
-                    {
-                        keys.Add(group.SubKeys[i]);
-                    }
-
-                    RegisteredGroups.Remove(groupName);
+                    RemoveByInternalKey(fullKey, knownGroup: groupName);
                 }
+            }
 
-                // Use RemoveByInternalKey to ensure persistent files are cleaned up
-                for (var i = 0; i < keys.Count; i++)
+            if (_dependencies.TryGetValue(groupName, out var deps))
+            {
+                for (int i = 0; i < deps.Length; i++)
                 {
-                    RemoveByInternalKey(keys[i]);
-                }
-
-                if (!_dependencies.TryGetValue(groupName, out var dependencies))
-                {
-                    return;
-                }
-
-                foreach (var dependancy in dependencies)
-                {
-                    RemoveGroup(dependancy);
+                    RemoveGroupInternal(deps[i], visited);
                 }
             }
         }
 
+        // =====================================================================
+        // Dependencies
+        // =====================================================================
+
         /// <summary>
-        /// Add group names that also need to be removed when a group is removed
+        /// Add group names that also need to be removed when this group is removed.
+        /// Repeated calls for the same group <em>replace</em> the existing dependencies.
+        /// Thread-safe.
         /// </summary>
-        /// <param name="groupName"></param>
-        /// <param name="dependencies"></param>
         public static void SetDependencies(string groupName, params string[] dependencies)
         {
-            List<string> dependenciesList = new List<string>();
-            foreach (var dependancy in dependencies)
-            {
-                dependenciesList.Add(dependancy);
-            }
-            _dependencies.Add(groupName, dependenciesList);
+            if (string.IsNullOrEmpty(groupName)) throw new ArgumentNullException(nameof(groupName));
+            _dependencies[groupName] = dependencies ?? Array.Empty<string>();
         }
 
+        // =====================================================================
+        // Persistent cache lifecycle
+        // =====================================================================
+
         /// <summary>
-        /// Enable persistent cache with default options (persists all cache groups)
+        /// Enable persistent cache with default options (no groups persisted by default).
         /// </summary>
         public static void EnablePersistentCache()
         {
             EnablePersistentCache(new PersistentCacheOptions());
         }
 
-
-
         /// <summary>
-        /// Enable persistent cache with custom options
+        /// Enable persistent cache with custom options.
         /// </summary>
-        /// <param name="options">Persistent cache configuration options</param>
         public static void EnablePersistentCache(PersistentCacheOptions options)
         {
             if (options == null) throw new ArgumentNullException(nameof(options));
@@ -417,19 +476,16 @@ namespace CacheUtility
                     options.BaseDirectory,
                     options.PersistentGroups?.Length > 0 ? string.Join(", ", options.PersistentGroups) : "none");
 
-            lock (CacheLock)
+            lock (_persistentLifecycleLock)
             {
-                // Ensure the internal HashSet is updated before setting options
                 options.UpdatePersistentGroupsSet();
                 _persistentOptions = options;
 
-                // Ensure cache directory exists
                 if (!Directory.Exists(options.BaseDirectory))
                 {
                     Directory.CreateDirectory(options.BaseDirectory);
                 }
 
-                // Start cleanup timer if not already running
                 if (_persistentCleanupTimer == null)
                 {
                     _persistentCleanupTimer = new Timer(CleanupExpiredPersistentFiles, null,
@@ -439,100 +495,75 @@ namespace CacheUtility
         }
 
         /// <summary>
-        /// Disable persistent cache
+        /// Disable persistent cache.
         /// </summary>
         public static void DisablePersistentCache()
         {
-            lock (CacheLock)
+            lock (_persistentLifecycleLock)
             {
                 _persistentOptions = null;
 
-                // Stop cleanup timer
                 _persistentCleanupTimer?.Dispose();
                 _persistentCleanupTimer = null;
             }
         }
 
         /// <summary>
-        /// Check if persistent cache is enabled
+        /// Check if persistent cache is enabled.
         /// </summary>
         public static bool IsPersistentCacheEnabled => _persistentOptions != null;
 
         /// <summary>
-        /// Determines whether a specific cache item should be persisted based on configuration
+        /// Determines whether a specific cache item should be persisted based on configuration.
         /// </summary>
-        /// <param name="groupName">Cache group name</param>
-        /// <param name="cacheKey">Cache key (without group prefix)</param>
-        /// <returns>True if the item should be persisted, false otherwise</returns>
-        private static bool ShouldPersistItem(string groupName, string cacheKey)
+        private static bool ShouldPersistItem(string groupName)
         {
-            if (_persistentOptions == null) return false;
-            if (_persistentOptions._persistentGroupsSet == null) return false;
-
-            // Only persist groups that are explicitly configured
-            return _persistentOptions._persistentGroupsSet.Contains(groupName);
+            var options = _persistentOptions;
+            if (options == null) return false;
+            var set = options._persistentGroupsSet;
+            if (set == null) return false;
+            return set.Contains(groupName);
         }
 
         /// <summary>
-        /// Get persistent cache configuration options
+        /// Get persistent cache configuration options (null if disabled).
         /// </summary>
-        /// <returns>Current persistent cache options or null if disabled</returns>
-        public static PersistentCacheOptions GetPersistentCacheOptions()
-        {
-            return _persistentOptions;
-        }
+        public static PersistentCacheOptions GetPersistentCacheOptions() => _persistentOptions;
 
         /// <summary>
-        /// Manually clean up expired persistent cache files
+        /// Manually clean up expired persistent cache files.
         /// </summary>
-        public static void CleanupExpiredPersistentCache()
-        {
-            CleanupExpiredPersistentFiles(null);
-        }
+        public static void CleanupExpiredPersistentCache() => CleanupExpiredPersistentFiles(null);
 
         /// <summary>
-        /// Get statistics about persistent cache
+        /// Get statistics about persistent cache.
         /// </summary>
-        /// <returns>Persistent cache statistics</returns>
         public static PersistentCacheStatistics GetPersistentCacheStatistics()
         {
-            if (_persistentOptions == null)
+            var options = _persistentOptions;
+            if (options == null)
             {
                 return new PersistentCacheStatistics
                 {
                     IsEnabled = false,
                     BaseDirectory = string.Empty,
-                    TotalFiles = 0,
-                    TotalSizeBytes = 0,
-                    CacheFiles = 0,
-                    MetaFiles = 0,
-                    LargestFileSize = 0,
-                    SmallestFileSize = 0,
-                    OrphanedFiles = 0
                 };
             }
 
             try
             {
-                if (!Directory.Exists(_persistentOptions.BaseDirectory))
+                if (!Directory.Exists(options.BaseDirectory))
                 {
                     return new PersistentCacheStatistics
                     {
                         IsEnabled = true,
-                        BaseDirectory = _persistentOptions.BaseDirectory,
-                        TotalFiles = 0,
-                        TotalSizeBytes = 0,
-                        CacheFiles = 0,
-                        MetaFiles = 0,
-                        LargestFileSize = 0,
-                        SmallestFileSize = 0,
-                        OrphanedFiles = 0
+                        BaseDirectory = options.BaseDirectory,
                     };
                 }
 
-                var cacheFiles = Directory.GetFiles(_persistentOptions.BaseDirectory, "*.cache");
-                var metaFiles = Directory.GetFiles(_persistentOptions.BaseDirectory, "*.meta");
-                var allFiles = cacheFiles.Concat(metaFiles).ToArray();
+                var cacheFiles = Directory.GetFiles(options.BaseDirectory, "*.cache");
+                var metaFiles = Directory.GetFiles(options.BaseDirectory, "*.meta");
+                var allFiles = cacheFiles.Length + metaFiles.Length;
 
                 long totalSize = 0;
                 long largestSize = 0;
@@ -540,47 +571,52 @@ namespace CacheUtility
                 DateTime? oldestTime = null;
                 DateTime? newestTime = null;
 
-                foreach (var file in allFiles)
+                void Inspect(string[] files)
                 {
-                    try
+                    for (int i = 0; i < files.Length; i++)
                     {
-                        var fileInfo = new FileInfo(file);
-                        var size = fileInfo.Length;
-                        var lastWrite = fileInfo.LastWriteTime;
+                        try
+                        {
+                            var fileInfo = new FileInfo(files[i]);
+                            var size = fileInfo.Length;
+                            var lastWrite = fileInfo.LastWriteTime;
 
-                        totalSize += size;
-                        largestSize = Math.Max(largestSize, size);
-                        smallestSize = Math.Min(smallestSize, size);
+                            totalSize += size;
+                            if (size > largestSize) largestSize = size;
+                            if (size < smallestSize) smallestSize = size;
 
-                        if (!oldestTime.HasValue || lastWrite < oldestTime.Value)
-                            oldestTime = lastWrite;
-                        if (!newestTime.HasValue || lastWrite > newestTime.Value)
-                            newestTime = lastWrite;
-                    }
-                    catch
-                    {
-                        // Ignore files that can't be accessed
+                            if (!oldestTime.HasValue || lastWrite < oldestTime.Value) oldestTime = lastWrite;
+                            if (!newestTime.HasValue || lastWrite > newestTime.Value) newestTime = lastWrite;
+                        }
+                        catch
+                        {
+                            // Skip files we can't stat.
+                        }
                     }
                 }
 
-                // Calculate orphaned files (cache files without corresponding meta files, or vice versa)
-                var cacheFileNames = cacheFiles.Select(f => Path.GetFileNameWithoutExtension(f)).ToHashSet();
-                var metaFileNames = metaFiles.Select(f => Path.GetFileNameWithoutExtension(f)).ToHashSet();
-                var orphanedCount = cacheFileNames.Except(metaFileNames).Count() + metaFileNames.Except(cacheFileNames).Count();
+                Inspect(cacheFiles);
+                Inspect(metaFiles);
+
+                var cacheNames = new HashSet<string>(cacheFiles.Select(Path.GetFileNameWithoutExtension), StringComparer.Ordinal);
+                var metaNames = new HashSet<string>(metaFiles.Select(Path.GetFileNameWithoutExtension), StringComparer.Ordinal);
+                int orphaned = 0;
+                foreach (var n in cacheNames) if (!metaNames.Contains(n)) orphaned++;
+                foreach (var n in metaNames) if (!cacheNames.Contains(n)) orphaned++;
 
                 return new PersistentCacheStatistics
                 {
                     IsEnabled = true,
-                    BaseDirectory = _persistentOptions.BaseDirectory,
-                    TotalFiles = allFiles.Length,
+                    BaseDirectory = options.BaseDirectory,
+                    TotalFiles = allFiles,
                     TotalSizeBytes = totalSize,
                     CacheFiles = cacheFiles.Length,
                     MetaFiles = metaFiles.Length,
                     OldestFileTime = oldestTime,
                     NewestFileTime = newestTime,
-                    LargestFileSize = allFiles.Length > 0 ? largestSize : 0,
-                    SmallestFileSize = allFiles.Length > 0 ? smallestSize : 0,
-                    OrphanedFiles = orphanedCount
+                    LargestFileSize = allFiles > 0 ? largestSize : 0,
+                    SmallestFileSize = allFiles > 0 ? smallestSize : 0,
+                    OrphanedFiles = orphaned
                 };
             }
             catch
@@ -588,152 +624,200 @@ namespace CacheUtility
                 return new PersistentCacheStatistics
                 {
                     IsEnabled = true,
-                    BaseDirectory = _persistentOptions.BaseDirectory,
-                    TotalFiles = 0,
-                    TotalSizeBytes = 0,
-                    CacheFiles = 0,
-                    MetaFiles = 0,
-                    LargestFileSize = 0,
-                    SmallestFileSize = 0,
-                    OrphanedFiles = 0
+                    BaseDirectory = options.BaseDirectory,
                 };
             }
         }
 
-        /// <summary>
-        /// Loads a cache item synchronously when it doesn't exist
-        /// </summary>
-        /// <typeparam name="TData">Cache item type</typeparam>
-        /// <param name="cacheKey">Full cache key</param>
-        /// <param name="originalCacheKey">Original cache key without group prefix</param>
-        /// <param name="groupName">Group name</param>
-        /// <param name="absoluteExpiration">Absolute expiration</param>
-        /// <param name="slidingExpiration">Sliding expiration</param>
-        /// <param name="priority">Cache priority</param>
-        /// <param name="populateMethod">Method to populate cache</param>
-        /// <param name="removedCallback">Removal callback</param>
-        /// <param name="refresh">Refresh interval</param>
-        /// <returns>Cache item value</returns>
-        private static TData LoadCacheItemSynchronously<TData>(string cacheKey, string originalCacheKey, string groupName, DateTime absoluteExpiration, TimeSpan slidingExpiration, CacheItemPriority priority, Func<TData> populateMethod, CacheEntryRemovedCallback removedCallback, TimeSpan refresh)
+        // =====================================================================
+        // Private helpers
+        // =====================================================================
+
+        private static string BuildFullKey(string groupName, string cacheKey) =>
+            string.Concat(groupName, "_", cacheKey);
+
+        private static void ValidateGetArgs<TData>(string cacheKey, string groupName, Func<TData> populateMethod)
         {
-            ReaderWriterLockSlim perCacheKeyLock;
+            if (string.IsNullOrEmpty(cacheKey)) throw new ArgumentNullException(nameof(cacheKey));
+            if (string.IsNullOrEmpty(groupName)) throw new ArgumentNullException(nameof(groupName));
+            if (populateMethod == null) throw new ArgumentNullException(nameof(populateMethod));
+        }
 
-            lock (CacheLock)
-            {
-                // Get or create the lock handle
-                if (!RegisteredKeys.TryGetValue(cacheKey, out perCacheKeyLock))
-                {
-                    perCacheKeyLock = new ReaderWriterLockSlim();
-                    RegisteredKeys.Add(cacheKey, perCacheKeyLock);
-                }
-            }
+        private static void ValidateGetArgsAsync<TData>(string cacheKey, string groupName, Func<Task<TData>> populateMethod)
+        {
+            if (string.IsNullOrEmpty(cacheKey)) throw new ArgumentNullException(nameof(cacheKey));
+            if (string.IsNullOrEmpty(groupName)) throw new ArgumentNullException(nameof(groupName));
+            if (populateMethod == null) throw new ArgumentNullException(nameof(populateMethod));
+        }
 
-            perCacheKeyLock.EnterWriteLock();
+        private static TimeSpan NormalizeRefresh(TimeSpan refresh)
+        {
+            // Edge case: refresh intervals < 1 second are disabled to avoid runaway timer churn.
+            return (refresh > TimeSpan.Zero && refresh < TimeSpan.FromSeconds(1))
+                ? TimeSpan.Zero
+                : refresh;
+        }
+
+        private static void MaybeStartBackgroundRefresh<TData>(CacheItem<TData> item, string fullCacheKey, TimeSpan refresh)
+        {
+            if (refresh <= TimeSpan.Zero) return;
+            if (item.IsRefreshing) return;
+            if (DateTime.Now - item.LastRefreshTime < refresh) return;
+            StartBackgroundRefresh(item, fullCacheKey);
+        }
+
+        /// <summary>
+        /// Synchronous populate path with single-flight de-duplication via Lazy.
+        /// </summary>
+        private static TData LoadCacheItemSynchronously<TData>(string fullKey, string cacheKey, string groupName, DateTime absoluteExpiration, TimeSpan slidingExpiration, CacheItemPriority priority, Func<TData> populateMethod, CacheEntryRemovedCallback removedCallback, TimeSpan refresh)
+        {
+            // Lazy is created lazily; only the winning thread's factory is invoked.
+            var newLazy = new Lazy<object>(
+                () => CreateAndStoreCacheItem(fullKey, cacheKey, groupName, absoluteExpiration, slidingExpiration, priority, populateMethod, removedCallback, refresh),
+                LazyThreadSafetyMode.ExecutionAndPublication);
+
+            var lazy = _inflightSync.GetOrAdd(fullKey, newLazy);
+
             try
             {
-                // Double-check item doesn't exist after acquiring lock
-                var item = MemoryCache.Default.Get(cacheKey) as CacheItem<TData>;
-                if (item != null)
-                {
-                    return item.Item; // Another thread created it
-                }
-
-                // Try to load from persistent cache first
-                item = LoadFromPersistentCache<TData>(cacheKey, originalCacheKey, groupName, absoluteExpiration, slidingExpiration);
-                if (item != null)
-                {
-                    // Found in persistent cache, add to memory cache and return
-                    AddToMemoryCache(cacheKey, item, absoluteExpiration, slidingExpiration, priority, removedCallback, refresh);
-                    return item.Item;
-                }
-
-                // Create new cache item
-                var value = populateMethod.Invoke();
-                item = new CacheItem<TData>
-                {
-                    Item = value,
-                    LastRefreshTime = DateTime.Now,
-                    RefreshInterval = refresh,
-                    PopulateMethod = populateMethod,
-                    CacheKey = originalCacheKey,
-                    GroupName = groupName,
-                    IsRefreshing = false,
-                    LastRefreshAttempt = DateTime.Now,
-                    AbsoluteExpiration = absoluteExpiration,
-                    SlidingExpiration = slidingExpiration
-                };
-
-                // Add to cache
-                lock (CacheLock)
-                {
-                    if (RegisteredGroups.ContainsKey(groupName))
-                    {
-                        RegisteredGroups[groupName].SubKeys.Add(cacheKey);
-                    }
-                    else
-                    {
-                        RegisteredGroups.Add(groupName, new CacheGroup { SubKeys = new List<string> { cacheKey } });
-                    }
-
-                    // The sliding expiration shouldn't be larger than one year from now
-                    var maxSlidingExpiration = DateTime.Now.AddYears(1) - DateTime.Now.AddMinutes(+1);
-                    if (slidingExpiration > maxSlidingExpiration)
-                    {
-                        slidingExpiration = maxSlidingExpiration;
-                    }
-
-                    var cacheItemPolicy = new CacheItemPolicy
-                    {
-                        AbsoluteExpiration = absoluteExpiration == DateTime.MaxValue ? DateTimeOffset.MaxValue : absoluteExpiration,
-                        SlidingExpiration = slidingExpiration,
-                        Priority = priority,
-                        RemovedCallback = CreateCombinedCallback(removedCallback, item)
-                    };
-
-                    MemoryCache.Default.Add(cacheKey, item, cacheItemPolicy);
-
-                    // Set up refresh timer if refresh interval is specified
-                    if (refresh > TimeSpan.Zero)
-                    {
-                        SetupRefreshTimer(item, cacheKey);
-                    }
-                }
-
-                // Save to persistent cache if enabled
-                SaveToPersistentCache(cacheKey, item, absoluteExpiration, slidingExpiration);
-
-                return item.Item;
+                var cacheItem = (CacheItem<TData>)lazy.Value;
+                return cacheItem.Item;
             }
             finally
             {
-                perCacheKeyLock.ExitWriteLock();
+                // Whether success or exception, drop the in-flight entry. On exception this
+                // allows the next caller to retry. On success, MemoryCache is the source of truth.
+                _inflightSync.TryRemove(new KeyValuePair<string, Lazy<object>>(fullKey, lazy));
             }
         }
 
+        private static CacheItem<TData> CreateAndStoreCacheItem<TData>(string fullKey, string cacheKey, string groupName, DateTime absoluteExpiration, TimeSpan slidingExpiration, CacheItemPriority priority, Func<TData> populateMethod, CacheEntryRemovedCallback removedCallback, TimeSpan refresh)
+        {
+            // Double-check the memory cache; another thread may have populated it just before we entered the Lazy.
+            if (MemoryCache.Default.Get(fullKey) is CacheItem<TData> alreadyThere)
+            {
+                return alreadyThere;
+            }
+
+            // Try persistent cache first.
+            var fromPersistent = LoadFromPersistentCache<TData>(fullKey, cacheKey, groupName, absoluteExpiration, slidingExpiration);
+            if (fromPersistent != null)
+            {
+                fromPersistent.PopulateMethodCache = populateMethod;
+                fromPersistent.RefreshInterval = refresh;
+                AddToMemoryCache(fullKey, fromPersistent, absoluteExpiration, slidingExpiration, priority, removedCallback, refresh);
+                return fromPersistent;
+            }
+
+            if (_logger.IsEnabled(LogLevel.Debug))
+            {
+                var methodName = GetMethodName(populateMethod);
+                _logger.LogDebug("Cache miss, loading data: {CacheKey} in group {GroupName} using {MethodName}", cacheKey, groupName, methodName);
+            }
+
+            var value = populateMethod.Invoke();
+            var item = new CacheItem<TData>
+            {
+                Item = value,
+                LastRefreshTime = DateTime.Now,
+                RefreshInterval = refresh,
+                PopulateMethodCache = populateMethod,
+                CacheKey = cacheKey,
+                GroupName = groupName,
+                IsRefreshing = false,
+                LastRefreshAttempt = DateTime.Now,
+                AbsoluteExpiration = absoluteExpiration,
+                SlidingExpiration = slidingExpiration
+            };
+            item.RecomputeEstimatedSize();
+
+            AddToMemoryCache(fullKey, item, absoluteExpiration, slidingExpiration, priority, removedCallback, refresh);
+            SaveToPersistentCache(fullKey, item, absoluteExpiration, slidingExpiration);
+
+            return item;
+        }
+
         /// <summary>
-        /// Starts a background refresh operation for a cache item
+        /// Asynchronous populate path with single-flight de-duplication via in-flight Task.
         /// </summary>
-        /// <typeparam name="TData">Cache item type</typeparam>
-        /// <param name="cacheItem">Cache item to refresh</param>
-        /// <param name="fullCacheKey">Full cache key</param>
+        private static Task<CacheItem<TData>> LoadCacheItemAsync<TData>(string fullKey, string cacheKey, string groupName, DateTime absoluteExpiration, TimeSpan slidingExpiration, CacheItemPriority priority, Func<Task<TData>> populateMethod, CacheEntryRemovedCallback removedCallback, TimeSpan refresh, CancellationToken cancellationToken)
+        {
+            var task = _inflightAsync.GetOrAdd(fullKey, _ =>
+                CreateAndStoreCacheItemAsync(fullKey, cacheKey, groupName, absoluteExpiration, slidingExpiration, priority, populateMethod, removedCallback, refresh)
+            );
+
+            return AwaitAsync(task, fullKey, cancellationToken);
+
+            static async Task<CacheItem<TData>> AwaitAsync(Task<object> shared, string key, CancellationToken ct)
+            {
+                try
+                {
+                    var item = await shared.WaitAsync(ct).ConfigureAwait(false);
+                    return (CacheItem<TData>)item;
+                }
+                finally
+                {
+                    _inflightAsync.TryRemove(new KeyValuePair<string, Task<object>>(key, shared));
+                }
+            }
+        }
+
+        private static async Task<object> CreateAndStoreCacheItemAsync<TData>(string fullKey, string cacheKey, string groupName, DateTime absoluteExpiration, TimeSpan slidingExpiration, CacheItemPriority priority, Func<Task<TData>> populateMethod, CacheEntryRemovedCallback removedCallback, TimeSpan refresh)
+        {
+            if (MemoryCache.Default.Get(fullKey) is CacheItem<TData> alreadyThere)
+            {
+                return alreadyThere;
+            }
+
+            var fromPersistent = LoadFromPersistentCache<TData>(fullKey, cacheKey, groupName, absoluteExpiration, slidingExpiration);
+            if (fromPersistent != null)
+            {
+                fromPersistent.RefreshInterval = refresh;
+                AddToMemoryCache(fullKey, fromPersistent, absoluteExpiration, slidingExpiration, priority, removedCallback, refresh);
+                return fromPersistent;
+            }
+
+            if (_logger.IsEnabled(LogLevel.Debug))
+            {
+                _logger.LogDebug("Async cache miss, loading data: {CacheKey} in group {GroupName}", cacheKey, groupName);
+            }
+
+            var value = await populateMethod().ConfigureAwait(false);
+            var item = new CacheItem<TData>
+            {
+                Item = value,
+                LastRefreshTime = DateTime.Now,
+                RefreshInterval = refresh,
+                CacheKey = cacheKey,
+                GroupName = groupName,
+                IsRefreshing = false,
+                LastRefreshAttempt = DateTime.Now,
+                AbsoluteExpiration = absoluteExpiration,
+                SlidingExpiration = slidingExpiration
+            };
+            item.RecomputeEstimatedSize();
+
+            AddToMemoryCache(fullKey, item, absoluteExpiration, slidingExpiration, priority, removedCallback, refresh);
+            SaveToPersistentCache(fullKey, item, absoluteExpiration, slidingExpiration);
+
+            return item;
+        }
+
+        /// <summary>
+        /// Starts a background refresh operation for a cache item.
+        /// </summary>
         private static void StartBackgroundRefresh<TData>(CacheItem<TData> cacheItem, string fullCacheKey)
         {
-            if (cacheItem?.PopulateMethod == null)
-                return;
+            if (cacheItem?.PopulateMethodCache == null) return;
 
-            // Use the item's refresh lock to prevent multiple concurrent refreshes
             lock (cacheItem.RefreshLock)
             {
-                // Double-check we're not already refreshing
-                if (cacheItem.IsRefreshing)
-                    return;
+                if (cacheItem.IsRefreshing) return;
 
-                // Prevent too frequent refresh attempts (minimum 1 second between attempts)
+                // Throttle to at most one refresh attempt per second.
                 var timeSinceLastAttempt = DateTime.Now - cacheItem.LastRefreshAttempt;
-                if (timeSinceLastAttempt < TimeSpan.FromSeconds(1))
-                    return;
+                if (timeSinceLastAttempt < TimeSpan.FromSeconds(1)) return;
 
-                // Mark as refreshing
                 cacheItem.IsRefreshing = true;
                 cacheItem.RefreshStartTime = DateTime.Now;
                 cacheItem.LastRefreshAttempt = DateTime.Now;
@@ -742,22 +826,14 @@ namespace CacheUtility
             if (_logger.IsEnabled(LogLevel.Debug))
                 _logger.LogDebug("Starting background refresh for {CacheKey} in group {GroupName}", cacheItem.CacheKey, cacheItem.GroupName);
 
-            // Start background refresh task
             cacheItem.RefreshTask = Task.Run(() =>
             {
                 try
                 {
-                    // Verify item still exists in cache
                     var currentItem = MemoryCache.Default.Get(fullCacheKey) as CacheItem<TData>;
-                    if (currentItem == null || currentItem != cacheItem)
-                    {
-                        return; // Cache item was removed or replaced
-                    }
+                    if (currentItem == null || currentItem != cacheItem) return;
 
-                    // Execute the populate method
-                    var newValue = cacheItem.PopulateMethod.Invoke();
-
-                    // Update the cache item with minimal locking
+                    var newValue = cacheItem.PopulateMethodCache.Invoke();
                     UpdateCacheItemValue(cacheItem, newValue);
 
                     if (_logger.IsEnabled(LogLevel.Debug))
@@ -770,7 +846,6 @@ namespace CacheUtility
                 }
                 finally
                 {
-                    // Always mark refresh as complete
                     lock (cacheItem.RefreshLock)
                     {
                         cacheItem.IsRefreshing = false;
@@ -779,59 +854,40 @@ namespace CacheUtility
             });
         }
 
-        /// <summary>
-        /// Updates a cache item value with minimal locking
-        /// </summary>
-        /// <typeparam name="TData">Cache item type</typeparam>
-        /// <param name="cacheItem">Cache item to update</param>
-        /// <param name="newValue">New value</param>
         private static void UpdateCacheItemValue<TData>(CacheItem<TData> cacheItem, TData newValue)
         {
             lock (cacheItem.RefreshLock)
             {
                 cacheItem.Item = newValue;
                 cacheItem.LastRefreshTime = DateTime.Now;
+                cacheItem.RecomputeEstimatedSize();
 
-                // Update persistent cache if enabled and item should be persisted
-                var fullCacheKey = $"{cacheItem.GroupName}_{cacheItem.CacheKey}";
-                SaveToPersistentCache(fullCacheKey, cacheItem, DateTime.MaxValue, TimeSpan.Zero);
+                var fullCacheKey = BuildFullKey(cacheItem.GroupName, cacheItem.CacheKey);
+                SaveToPersistentCache(fullCacheKey, cacheItem, cacheItem.AbsoluteExpiration, cacheItem.SlidingExpiration);
             }
         }
 
-        /// <summary>
-        /// Creates a combined callback that handles both user callback and timer disposal
-        /// </summary>
-        /// <typeparam name="T">Cache item type</typeparam>
-        /// <param name="userCallback">User-provided callback</param>
-        /// <param name="cacheItem">Cache item to dispose</param>
-        /// <returns>Combined callback</returns>
-        private static CacheEntryRemovedCallback CreateCombinedCallback<T>(CacheEntryRemovedCallback userCallback, CacheItem<T> cacheItem)
+        private static CacheEntryRemovedCallback CreateCombinedCallback(CacheEntryRemovedCallback userCallback, ICacheItem cacheItem)
         {
             return (args) =>
             {
-                // Dispose the cache item (which will dispose the timer)
                 cacheItem?.Dispose();
 
-                // Call user callback if provided
+                // Clean up subkey set so RegisteredKeys/groups don't leak.
+                if (cacheItem != null && _groups.TryGetValue(cacheItem.GroupName, out var subkeys))
+                {
+                    subkeys.TryRemove(args.CacheItem.Key, out _);
+                }
+
                 userCallback?.Invoke(args);
             };
         }
 
-        /// <summary>
-        /// Sets up the refresh timer for a cache item
-        /// </summary>
-        /// <typeparam name="T">Cache item type</typeparam>
-        /// <param name="cacheItem">Cache item to refresh</param>
-        /// <param name="fullCacheKey">Full cache key (including group prefix)</param>
         private static void SetupRefreshTimer<T>(CacheItem<T> cacheItem, string fullCacheKey)
         {
-            if (cacheItem.RefreshInterval <= TimeSpan.Zero || cacheItem.PopulateMethod == null)
-                return;
+            if (cacheItem.RefreshInterval <= TimeSpan.Zero || cacheItem.PopulateMethodCache == null) return;
 
-            // Dispose existing timer if any
             cacheItem.RefreshTimer?.Dispose();
-
-            // Create new timer
             cacheItem.RefreshTimer = new Timer(
                 callback: (state) => RefreshCacheItem(fullCacheKey, cacheItem),
                 state: null,
@@ -840,145 +896,113 @@ namespace CacheUtility
             );
         }
 
-        /// <summary>
-        /// Refreshes a cache item using its populate method (called by timer)
-        /// Now uses non-blocking approach
-        /// </summary>
-        /// <typeparam name="T">Cache item type</typeparam>
-        /// <param name="fullCacheKey">Full cache key (including group prefix)</param>
-        /// <param name="cacheItem">Cache item to refresh</param>
         private static void RefreshCacheItem<T>(string fullCacheKey, CacheItem<T> cacheItem)
         {
-            if (cacheItem?.PopulateMethod == null)
-                return;
+            if (cacheItem?.PopulateMethodCache == null) return;
 
             try
             {
-                // Check if the cache key still exists
-                lock (CacheLock)
-                {
-                    if (!RegisteredKeys.ContainsKey(fullCacheKey))
-                    {
-                        // Cache item was removed, dispose timer
-                        cacheItem.Dispose();
-                        return;
-                    }
-                }
-
-                // Verify item still exists in cache
                 var currentItem = MemoryCache.Default.Get(fullCacheKey) as CacheItem<T>;
                 if (currentItem == null || currentItem != cacheItem)
                 {
-                    // Cache item was replaced or removed
                     cacheItem.Dispose();
                     return;
                 }
-
-                // Use the same non-blocking refresh mechanism as manual refreshes
                 StartBackgroundRefresh(cacheItem, fullCacheKey);
             }
             catch (Exception)
             {
-                // If any error occurs in timer callback, dispose the timer to prevent further issues
                 cacheItem?.Dispose();
             }
         }
 
-        /// <summary>
-        /// Loads a cache item from persistent storage
-        /// </summary>
-        /// <typeparam name="TData">Cache item type</typeparam>
-        /// <param name="cacheKey">Full cache key</param>
-        /// <param name="originalCacheKey">Original cache key without group prefix</param>
-        /// <param name="groupName">Group name</param>
-        /// <param name="absoluteExpiration">Absolute expiration</param>
-        /// <param name="slidingExpiration">Sliding expiration</param>
-        /// <returns>Cache item if found and valid, null otherwise</returns>
-        private static CacheItem<TData> LoadFromPersistentCache<TData>(string cacheKey, string originalCacheKey, string groupName, DateTime absoluteExpiration, TimeSpan slidingExpiration)
-        {
-            if (_persistentOptions == null) return null;
+        // =====================================================================
+        // Persistent cache I/O
+        // =====================================================================
 
-            // Check if this item should be persisted (if not, don't try to load it)
-            if (!ShouldPersistItem(groupName, originalCacheKey))
-            {
-                return null; // This item shouldn't be persisted, so don't try to load it
-            }
+        private static CacheItem<TData> LoadFromPersistentCache<TData>(string fullKey, string cacheKey, string groupName, DateTime absoluteExpiration, TimeSpan slidingExpiration)
+        {
+            var options = _persistentOptions;
+            if (options == null) return null;
+            if (!ShouldPersistItem(groupName)) return null;
 
             try
             {
-                var cacheFilePath = GetPersistentCacheFilePath(cacheKey);
-                var metaFilePath = GetPersistentCacheMetaFilePath(cacheKey);
+                var cacheFilePath = GetPersistentCacheFilePath(fullKey);
+                var metaFilePath = GetPersistentCacheMetaFilePath(fullKey);
 
-                // Quick check: if cache file doesn't exist, don't bother checking meta file
                 if (!File.Exists(cacheFilePath)) return null;
                 if (!File.Exists(metaFilePath)) return null;
 
-                // Load metadata first to check expiration
                 var metaJson = File.ReadAllText(metaFilePath);
                 var metadata = JsonSerializer.Deserialize<PersistentCacheMetadata>(metaJson, CacheJsonOptions);
 
-                // Check if expired
-                if (metadata.IsExpired())
+                if (metadata == null || metadata.IsExpired())
                 {
-                    // Remove expired files
-                    File.Delete(cacheFilePath);
-                    File.Delete(metaFilePath);
+                    SafeDelete(cacheFilePath);
+                    SafeDelete(metaFilePath);
                     return null;
                 }
 
-                // Load cache data
                 var dataJson = File.ReadAllText(cacheFilePath);
                 var persistentItem = JsonSerializer.Deserialize<PersistentCacheItem<TData>>(dataJson, CacheJsonOptions);
-
                 if (persistentItem == null || persistentItem.Item == null) return null;
 
-                // Create cache item
                 var cacheItem = new CacheItem<TData>
                 {
                     Item = persistentItem.Item,
                     LastRefreshTime = persistentItem.LastRefreshTime,
-                    RefreshInterval = TimeSpan.Zero, // Will be set by caller if needed
-                    CacheKey = originalCacheKey,
+                    RefreshInterval = TimeSpan.Zero,
+                    CacheKey = cacheKey,
                     GroupName = groupName,
                     IsRefreshing = false,
                     LastRefreshAttempt = persistentItem.LastRefreshTime,
                     AbsoluteExpiration = absoluteExpiration,
                     SlidingExpiration = slidingExpiration
                 };
+                cacheItem.RecomputeEstimatedSize();
+
+                // Touch LastAccessTime for sliding expiration support, throttled to ~10% of the
+                // sliding window to bound write amplification on hot keys.
+                if (metadata.SlidingExpiration > TimeSpan.Zero)
+                {
+                    var now = DateTime.Now;
+                    var elapsed = now - metadata.LastAccessTime;
+                    var threshold = TimeSpan.FromTicks(Math.Max(metadata.SlidingExpiration.Ticks / 10, TimeSpan.FromSeconds(1).Ticks));
+                    if (elapsed > threshold)
+                    {
+                        try
+                        {
+                            metadata.LastAccessTime = now;
+                            var refreshedJson = JsonSerializer.Serialize(metadata, CacheJsonOptions);
+                            WriteFileAtomic(metaFilePath, refreshedJson);
+                        }
+                        catch
+                        {
+                            // Touching is best-effort; the value was still loaded successfully.
+                        }
+                    }
+                }
 
                 return cacheItem;
             }
             catch
             {
-                // If loading fails, return null to fall back to populate method
                 return null;
             }
         }
 
-        /// <summary>
-        /// Saves a cache item to persistent storage
-        /// </summary>
-        /// <typeparam name="TData">Cache item type</typeparam>
-        /// <param name="cacheKey">Full cache key</param>
-        /// <param name="cacheItem">Cache item to save</param>
-        /// <param name="absoluteExpiration">Absolute expiration</param>
-        /// <param name="slidingExpiration">Sliding expiration</param>
-        private static void SaveToPersistentCache<TData>(string cacheKey, CacheItem<TData> cacheItem, DateTime absoluteExpiration, TimeSpan slidingExpiration)
+        private static void SaveToPersistentCache<TData>(string fullKey, CacheItem<TData> cacheItem, DateTime absoluteExpiration, TimeSpan slidingExpiration)
         {
-            if (_persistentOptions == null) return;
-
-            // Check if this specific item should be persisted
-            if (!ShouldPersistItem(cacheItem.GroupName, cacheItem.CacheKey))
-            {
-                return; // Skip persistence for this item
-            }
+            var options = _persistentOptions;
+            if (options == null) return;
+            if (!ShouldPersistItem(cacheItem.GroupName)) return;
 
             try
             {
-                var cacheFilePath = GetPersistentCacheFilePath(cacheKey);
-                var metaFilePath = GetPersistentCacheMetaFilePath(cacheKey);
+                var cacheFilePath = GetPersistentCacheFilePath(fullKey);
+                var metaFilePath = GetPersistentCacheMetaFilePath(fullKey);
 
-                // Create persistent cache item
                 var persistentItem = new PersistentCacheItem<TData>
                 {
                     Item = cacheItem.Item,
@@ -987,7 +1011,6 @@ namespace CacheUtility
                     GroupName = cacheItem.GroupName
                 };
 
-                // Create metadata
                 var metadata = new PersistentCacheMetadata
                 {
                     CreatedTime = DateTime.Now,
@@ -996,574 +1019,383 @@ namespace CacheUtility
                     LastAccessTime = DateTime.Now
                 };
 
-                // Serialize and save
                 var dataJson = JsonSerializer.Serialize(persistentItem, CacheJsonOptions);
+
+                if (options.MaxFileSize > 0 && System.Text.Encoding.UTF8.GetByteCount(dataJson) > options.MaxFileSize)
+                {
+                    return;
+                }
+
                 var metaJson = JsonSerializer.Serialize(metadata, CacheJsonOptions);
 
-                // Check file size limit
-                if (_persistentOptions.MaxFileSize > 0 && System.Text.Encoding.UTF8.GetByteCount(dataJson) > _persistentOptions.MaxFileSize)
-                {
-                    return; // Skip saving if too large
-                }
-
-                File.WriteAllText(cacheFilePath, dataJson);
-                File.WriteAllText(metaFilePath, metaJson);
+                // Write data first; if a crash occurs before meta is written, the orphan-cleanup
+                // logic will remove the dangling .cache file on next cleanup pass.
+                WriteFileAtomic(cacheFilePath, dataJson);
+                WriteFileAtomic(metaFilePath, metaJson);
             }
             catch
             {
-                // Ignore persistence errors - cache should still work in memory
+                // Persistence is best-effort; in-memory cache always works.
             }
         }
 
         /// <summary>
-        /// Removes a cache item from persistent storage
+        /// Writes <paramref name="content"/> to <paramref name="path"/> atomically by writing to a
+        /// temp file first and then renaming. A crash mid-write leaves the previous file intact.
         /// </summary>
-        /// <param name="cacheKey">Full cache key</param>
-        private static void RemoveFromPersistentCache(string cacheKey)
+        private static void WriteFileAtomic(string path, string content)
+        {
+            var tmp = path + ".tmp";
+            File.WriteAllText(tmp, content);
+            File.Move(tmp, path, overwrite: true);
+        }
+
+        private static void SafeDelete(string path)
+        {
+            try { if (File.Exists(path)) File.Delete(path); } catch { /* ignore */ }
+        }
+
+        private static void RemoveFromPersistentCache(string fullKey)
         {
             if (_persistentOptions == null) return;
-
             try
             {
-                var cacheFilePath = GetPersistentCacheFilePath(cacheKey);
-                var metaFilePath = GetPersistentCacheMetaFilePath(cacheKey);
-
-                if (File.Exists(cacheFilePath)) File.Delete(cacheFilePath);
-                if (File.Exists(metaFilePath)) File.Delete(metaFilePath);
+                SafeDelete(GetPersistentCacheFilePath(fullKey));
+                SafeDelete(GetPersistentCacheMetaFilePath(fullKey));
             }
             catch
             {
-                // Ignore deletion errors
+                // ignore
             }
         }
 
-        /// <summary>
-        /// Adds a cache item to memory cache (helper method)
-        /// </summary>
-        /// <typeparam name="TData">Cache item type</typeparam>
-        /// <param name="cacheKey">Full cache key</param>
-        /// <param name="item">Cache item</param>
-        /// <param name="absoluteExpiration">Absolute expiration</param>
-        /// <param name="slidingExpiration">Sliding expiration</param>
-        /// <param name="priority">Cache priority</param>
-        /// <param name="removedCallback">Removal callback</param>
-        /// <param name="refresh">Refresh interval</param>
-        private static void AddToMemoryCache<TData>(string cacheKey, CacheItem<TData> item, DateTime absoluteExpiration, TimeSpan slidingExpiration, CacheItemPriority priority, CacheEntryRemovedCallback removedCallback, TimeSpan refresh)
+        private static void AddToMemoryCache<TData>(string fullKey, CacheItem<TData> item, DateTime absoluteExpiration, TimeSpan slidingExpiration, CacheItemPriority priority, CacheEntryRemovedCallback removedCallback, TimeSpan refresh)
         {
-            lock (CacheLock)
+            var groupName = item.GroupName;
+
+            // Add to (or create) the group's subkey set.
+            var subkeys = _groups.GetOrAdd(groupName, _ => new ConcurrentDictionary<string, byte>(StringComparer.Ordinal));
+            subkeys.TryAdd(fullKey, 0);
+
+            if (slidingExpiration > MaxSlidingExpiration)
             {
-                var groupName = item.GroupName;
+                slidingExpiration = MaxSlidingExpiration;
+            }
 
-                if (RegisteredGroups.ContainsKey(groupName))
-                {
-                    RegisteredGroups[groupName].SubKeys.Add(cacheKey);
-                }
-                else
-                {
-                    RegisteredGroups.Add(groupName, new CacheGroup { SubKeys = new List<string> { cacheKey } });
-                }
+            var cacheItemPolicy = new CacheItemPolicy
+            {
+                AbsoluteExpiration = absoluteExpiration == DateTime.MaxValue ? DateTimeOffset.MaxValue : absoluteExpiration,
+                SlidingExpiration = slidingExpiration,
+                Priority = priority,
+                RemovedCallback = CreateCombinedCallback(removedCallback, item)
+            };
 
-                // The sliding expiration shouldn't be larger than one year from now
-                var maxSlidingExpiration = DateTime.Now.AddYears(1) - DateTime.Now.AddMinutes(+1);
-                if (slidingExpiration > maxSlidingExpiration)
-                {
-                    slidingExpiration = maxSlidingExpiration;
-                }
+            MemoryCache.Default.Add(fullKey, item, cacheItemPolicy);
 
-                var cacheItemPolicy = new CacheItemPolicy
-                {
-                    AbsoluteExpiration = absoluteExpiration == DateTime.MaxValue ? DateTimeOffset.MaxValue : absoluteExpiration,
-                    SlidingExpiration = slidingExpiration,
-                    Priority = priority,
-                    RemovedCallback = CreateCombinedCallback(removedCallback, item)
-                };
-
-                MemoryCache.Default.Add(cacheKey, item, cacheItemPolicy);
-
-                // Set up refresh timer if refresh interval is specified
-                if (refresh > TimeSpan.Zero)
-                {
-                    item.RefreshInterval = refresh;
-                    SetupRefreshTimer(item, cacheKey);
-                }
+            if (refresh > TimeSpan.Zero)
+            {
+                item.RefreshInterval = refresh;
+                SetupRefreshTimer(item, fullKey);
             }
         }
 
-        /// <summary>
-        /// Gets the file path for persistent cache data
-        /// </summary>
-        /// <param name="cacheKey">Full cache key</param>
-        /// <returns>File path</returns>
-        private static string GetPersistentCacheFilePath(string cacheKey)
-        {
-            var safeFileName = GetSafeFileName(cacheKey);
-            return Path.Combine(_persistentOptions.BaseDirectory, $"{safeFileName}.cache");
-        }
+        private static string GetPersistentCacheFilePath(string fullKey) =>
+            Path.Combine(_persistentOptions.BaseDirectory, $"{GetSafeFileName(fullKey)}.cache");
 
-        /// <summary>
-        /// Gets the file path for persistent cache metadata
-        /// </summary>
-        /// <param name="cacheKey">Full cache key</param>
-        /// <returns>File path</returns>
-        private static string GetPersistentCacheMetaFilePath(string cacheKey)
-        {
-            var safeFileName = GetSafeFileName(cacheKey);
-            return Path.Combine(_persistentOptions.BaseDirectory, $"{safeFileName}.meta");
-        }
+        private static string GetPersistentCacheMetaFilePath(string fullKey) =>
+            Path.Combine(_persistentOptions.BaseDirectory, $"{GetSafeFileName(fullKey)}.meta");
 
-        /// <summary>
-        /// Converts cache key to safe filename
-        /// </summary>
-        /// <param name="cacheKey">Cache key</param>
-        /// <returns>Safe filename</returns>
         private static string GetSafeFileName(string cacheKey)
         {
             var invalidChars = Path.GetInvalidFileNameChars();
             var safeFileName = cacheKey;
-
-            foreach (var c in invalidChars)
+            for (int i = 0; i < invalidChars.Length; i++)
             {
-                safeFileName = safeFileName.Replace(c, '_');
+                safeFileName = safeFileName.Replace(invalidChars[i], '_');
             }
-
             return safeFileName;
         }
 
         /// <summary>
-        /// Cleans up expired persistent cache files
+        /// Removes a single cache entry, including its persistent file, group membership and any in-flight populate task.
         /// </summary>
-        /// <param name="state">Timer state (unused)</param>
+        private static void RemoveByInternalKey(string fullKey, string knownGroup = null)
+        {
+            var existing = MemoryCache.Default.Get(fullKey) as ICacheItem;
+            existing?.Dispose();
+
+            var group = knownGroup ?? existing?.GroupName;
+            if (group != null && _groups.TryGetValue(group, out var subkeys))
+            {
+                subkeys.TryRemove(fullKey, out _);
+            }
+
+            MemoryCache.Default.Remove(fullKey);
+            _inflightSync.TryRemove(fullKey, out _);
+            _inflightAsync.TryRemove(fullKey, out _);
+
+            RemoveFromPersistentCache(fullKey);
+        }
+
+        /// <summary>
+        /// Cleans up expired persistent cache files. Uses filesystem timestamps as a cheap pre-filter
+        /// to avoid parsing every meta file every cleanup pass.
+        /// </summary>
         private static void CleanupExpiredPersistentFiles(object state)
         {
-            if (_persistentOptions == null) return;
+            var options = _persistentOptions;
+            if (options == null) return;
 
             try
             {
-                if (!Directory.Exists(_persistentOptions.BaseDirectory)) return;
+                if (!Directory.Exists(options.BaseDirectory)) return;
 
-                var metaFiles = Directory.GetFiles(_persistentOptions.BaseDirectory, "*.meta");
+                var metaFiles = Directory.GetFiles(options.BaseDirectory, "*.meta");
+                var now = DateTime.Now;
 
-                foreach (var metaFile in metaFiles)
+                for (int i = 0; i < metaFiles.Length; i++)
                 {
+                    var metaFile = metaFiles[i];
                     try
                     {
+                        // Cheap pre-filter: if the file is younger than 1 minute we skip parsing
+                        // (it almost certainly hasn't expired yet, and parsing N files is expensive).
+                        var lastWrite = File.GetLastWriteTime(metaFile);
+                        if (now - lastWrite < TimeSpan.FromMinutes(1)) continue;
+
                         var metaJson = File.ReadAllText(metaFile);
                         var metadata = JsonSerializer.Deserialize<PersistentCacheMetadata>(metaJson, CacheJsonOptions);
 
-                        if (metadata.IsExpired())
+                        if (metadata == null || metadata.IsExpired())
                         {
-                            // Remove both meta and cache files
                             var cacheFile = Path.ChangeExtension(metaFile, ".cache");
-
-                            File.Delete(metaFile);
-                            if (File.Exists(cacheFile))
-                            {
-                                File.Delete(cacheFile);
-                            }
+                            SafeDelete(metaFile);
+                            SafeDelete(cacheFile);
                         }
                     }
                     catch
                     {
-                        // If we can't read the meta file, delete both files
+                        // Corrupt meta file -> remove both
                         try
                         {
                             var cacheFile = Path.ChangeExtension(metaFile, ".cache");
-                            File.Delete(metaFile);
-                            if (File.Exists(cacheFile))
-                            {
-                                File.Delete(cacheFile);
-                            }
+                            SafeDelete(metaFile);
+                            SafeDelete(cacheFile);
                         }
                         catch
                         {
-                            // Ignore cleanup errors
+                            // ignore
                         }
+                    }
+                }
+
+                // Orphan cleanup: any .cache without a sibling .meta is dead (e.g., crash mid-write).
+                var cacheFiles = Directory.GetFiles(options.BaseDirectory, "*.cache");
+                for (int i = 0; i < cacheFiles.Length; i++)
+                {
+                    var siblingMeta = Path.ChangeExtension(cacheFiles[i], ".meta");
+                    if (!File.Exists(siblingMeta))
+                    {
+                        SafeDelete(cacheFiles[i]);
                     }
                 }
             }
             catch
             {
-                // Ignore cleanup errors
+                // ignore
             }
         }
 
-        /// <summary>
-        /// Helper class to support cache groups
-        /// </summary>
-        private struct CacheGroup
-        {
-            /// <summary>
-            /// A list of all the keys that were registered with this group.
-            /// </summary>
-            public List<string> SubKeys;
-        }
+        // =====================================================================
+        // Lifecycle
+        // =====================================================================
 
         /// <summary>
-        /// Cache Item
-        /// </summary>
-        /// <typeparam name="T">Cached Item type</typeparam>
-        [Serializable]
-        public class CacheItem<T> : IDisposable
-        {
-            /// <summary>
-            /// The populate method used to refresh this cache item (not serialized)
-            /// </summary>
-            [NonSerialized]
-            private Func<T> _populateMethod;
-
-            /// <summary>
-            /// Timer for automatic refresh (not serialized)
-            /// </summary>
-            [NonSerialized]
-            private Timer _refreshTimer;
-
-            /// <summary>
-            /// Current refresh task (not serialized)
-            /// </summary>
-            [NonSerialized]
-            private Task _refreshTask;
-
-            /// <summary>
-            /// Lock for refresh state operations (not serialized)
-            /// </summary>
-            [NonSerialized]
-            private readonly object _refreshLock = new object();
-
-            /// <summary>
-            /// Cached item
-            /// </summary>
-            /// <value>The item.</value>
-            public T Item { get; set; }
-
-            /// <summary>
-            /// The last time this cache item was refreshed
-            /// </summary>
-            public DateTime LastRefreshTime { get; set; }
-
-            /// <summary>
-            /// The refresh interval for this cache item
-            /// </summary>
-            public TimeSpan RefreshInterval { get; set; }
-
-            /// <summary>
-            /// Cache key for this item (used in refresh callbacks)
-            /// </summary>
-            public string CacheKey { get; set; }
-
-            /// <summary>
-            /// Group name for this item (used in refresh callbacks)
-            /// </summary>
-            public string GroupName { get; set; }
-
-            /// <summary>
-            /// Indicates if a refresh operation is currently in progress
-            /// </summary>
-            public bool IsRefreshing { get; set; }
-
-            /// <summary>
-            /// When the current refresh operation started
-            /// </summary>
-            public DateTime RefreshStartTime { get; set; }
-
-            /// <summary>
-            /// The last time a refresh was attempted (regardless of success)
-            /// </summary>
-            public DateTime LastRefreshAttempt { get; set; }
-
-            /// <summary>
-            /// Absolute expiration date for this cache item
-            /// </summary>
-            public DateTime AbsoluteExpiration { get; set; }
-
-            /// <summary>
-            /// Sliding expiration duration for this cache item
-            /// </summary>
-            public TimeSpan SlidingExpiration { get; set; }
-
-            /// <summary>
-            /// The populate method used to refresh this cache item
-            /// </summary>
-            public Func<T> PopulateMethod
-            {
-                get => _populateMethod;
-                set => _populateMethod = value;
-            }
-
-            /// <summary>
-            /// Timer for automatic refresh
-            /// </summary>
-            public Timer RefreshTimer
-            {
-                get => _refreshTimer;
-                set => _refreshTimer = value;
-            }
-
-            /// <summary>
-            /// Current refresh task
-            /// </summary>
-            public Task RefreshTask
-            {
-                get => _refreshTask;
-                set => _refreshTask = value;
-            }
-
-            /// <summary>
-            /// Lock for refresh state operations
-            /// </summary>
-            public object RefreshLock => _refreshLock ?? new object();
-
-            /// <summary>
-            /// Dispose of the refresh timer when cache item is disposed
-            /// </summary>
-            public void Dispose()
-            {
-                _refreshTimer?.Dispose();
-                _refreshTimer = null;
-                // Note: We don't dispose the refresh task as it may still be running
-            }
-        }
-
-        /// <summary>
-        /// Add IDisposable implementation to properly clean up ReaderWriterLockSlim instances
+        /// Releases internal resources (persistent cache timer, etc.).
         /// </summary>
         public static void Dispose()
         {
-            foreach (var lockSlim in RegisteredKeys.Values)
+            // Persistent cache timer
+            lock (_persistentLifecycleLock)
             {
-                lockSlim.Dispose();
+                _persistentCleanupTimer?.Dispose();
+                _persistentCleanupTimer = null;
             }
-            RegisteredKeys.Clear();
-
-            // Clean up persistent cache timer
-            _persistentCleanupTimer?.Dispose();
-            _persistentCleanupTimer = null;
         }
 
+        // =====================================================================
+        // Inspection / introspection
+        // =====================================================================
+
         /// <summary>
-        /// Retrieve all cached items from a specific group
+        /// Retrieve all cached items from a specific group as a dictionary keyed by the original cache key.
+        /// Values are returned as <see cref="object"/>; use the generic overload for typed access.
         /// </summary>
-        /// <param name="groupName">The name of the cache group</param>
-        /// <returns>Dictionary containing the original cache keys (without group prefix) and their cached values</returns>
+        /// <remarks>
+        /// When all items in the group share a known type, prefer
+        /// <see cref="GetAllByGroup{TData}(string)"/> to avoid boxing and the cast-per-item cost
+        /// at the call site. This non-generic overload remains useful for monitoring or diagnostic
+        /// code that iterates groups whose item type is not known statically.
+        /// </remarks>
         public static Dictionary<string, object> GetAllByGroup(string groupName)
         {
             if (string.IsNullOrEmpty(groupName)) throw new ArgumentNullException(nameof(groupName));
 
             var result = new Dictionary<string, object>();
+            if (!_groups.TryGetValue(groupName, out var subkeys)) return result;
 
-            lock (CacheLock)
+            foreach (var fullKey in subkeys.Keys)
             {
-                if (!RegisteredGroups.TryGetValue(groupName, out var group))
+                var cached = MemoryCache.Default.Get(fullKey);
+                if (cached is ICacheItem ci)
                 {
-                    return result; // Return empty dictionary if group doesn't exist
+                    // Use the stored original CacheKey rather than substring-parsing the full key,
+                    // which is fragile when the group name itself contains underscores.
+                    result[ci.CacheKey] = ci.ItemBoxed;
                 }
-
-                foreach (var fullCacheKey in group.SubKeys)
+                else if (cached != null)
                 {
-                    var cachedItem = MemoryCache.Default.Get(fullCacheKey);
-                    if (cachedItem != null)
-                    {
-                        // Extract the original cache key by removing the group prefix
-                        var originalKey = fullCacheKey.Substring(groupName.Length + 1); // +1 for the underscore
-
-                        // Extract the actual item from the CacheItem wrapper
-                        if (cachedItem.GetType().IsGenericType &&
-                            cachedItem.GetType().GetGenericTypeDefinition() == typeof(CacheItem<>))
-                        {
-                            var itemProperty = cachedItem.GetType().GetProperty("Item");
-                            if (itemProperty != null)
-                            {
-                                result[originalKey] = itemProperty.GetValue(cachedItem);
-                            }
-                        }
-                        else
-                        {
-                            result[originalKey] = cachedItem;
-                        }
-                    }
+                    var originalKey = fullKey.Length > groupName.Length + 1
+                        ? fullKey.Substring(groupName.Length + 1)
+                        : fullKey;
+                    result[originalKey] = cached;
                 }
             }
-
             return result;
         }
 
         /// <summary>
-        /// Get metadata for all cached items
+        /// Strongly-typed variant of <see cref="GetAllByGroup(string)"/>. Items whose stored type
+        /// does not match <typeparamref name="TData"/> are skipped.
         /// </summary>
-        /// <returns>Enumerable collection of cache item metadata</returns>
-        public static IEnumerable<CacheItemMetadata> GetAllCacheMetadata()
+        public static Dictionary<string, TData> GetAllByGroup<TData>(string groupName)
         {
-            var metadataList = new List<CacheItemMetadata>();
+            if (string.IsNullOrEmpty(groupName)) throw new ArgumentNullException(nameof(groupName));
 
-            lock (CacheLock)
+            var result = new Dictionary<string, TData>();
+            if (!_groups.TryGetValue(groupName, out var subkeys)) return result;
+
+            foreach (var fullKey in subkeys.Keys)
             {
-                foreach (var group in RegisteredGroups)
+                if (MemoryCache.Default.Get(fullKey) is CacheItem<TData> typed)
                 {
-                    var groupName = group.Key;
-                    foreach (var fullCacheKey in group.Value.SubKeys)
-                    {
-                        var cachedItem = MemoryCache.Default.Get(fullCacheKey);
-                        if (cachedItem != null)
-                        {
-                            var metadata = CreateMetadataFromCacheItem(fullCacheKey, groupName, cachedItem);
-                            if (metadata != null)
-                            {
-                                metadataList.Add(metadata);
-                            }
-                        }
-                    }
+                    result[typed.CacheKey] = typed.Item;
                 }
             }
-
-            return metadataList;
+            return result;
         }
 
         /// <summary>
-        /// Creates metadata object from a cache item
+        /// Get metadata for all cached items.
         /// </summary>
-        /// <param name="fullCacheKey">Full cache key including group prefix</param>
-        /// <param name="groupName">Group name</param>
-        /// <param name="cachedItem">The cached item object</param>
-        /// <returns>CacheItemMetadata object or null if item cannot be processed</returns>
-        private static CacheItemMetadata CreateMetadataFromCacheItem(string fullCacheKey, string groupName, object cachedItem)
+        public static IEnumerable<CacheItemMetadata> GetAllCacheMetadata()
+        {
+            var metadataList = new List<CacheItemMetadata>();
+            var persistentEnabled = _persistentOptions != null;
+
+            foreach (var groupKvp in _groups)
+            {
+                var groupName = groupKvp.Key;
+                foreach (var fullCacheKey in groupKvp.Value.Keys)
+                {
+                    var cachedItem = MemoryCache.Default.Get(fullCacheKey);
+                    if (cachedItem == null) continue;
+
+                    var metadata = CreateMetadataFromCacheItem(fullCacheKey, groupName, cachedItem, persistentEnabled);
+                    if (metadata != null) metadataList.Add(metadata);
+                }
+            }
+            return metadataList;
+        }
+
+        private static CacheItemMetadata CreateMetadataFromCacheItem(string fullCacheKey, string groupName, object cachedItem, bool persistentEnabled)
         {
             try
             {
-                // Extract original cache key by removing group prefix
-                var originalKey = fullCacheKey.Substring(groupName.Length + 1); // +1 for underscore
-
-                // Check if this is a CacheItem<T> wrapper
-                if (cachedItem.GetType().IsGenericType &&
-                    cachedItem.GetType().GetGenericTypeDefinition() == typeof(CacheItem<>))
+                if (cachedItem is ICacheItem ci)
                 {
-                    // Extract properties from CacheItem<T>
-                    var itemProperty = cachedItem.GetType().GetProperty("Item");
-                    var lastRefreshTimeProperty = cachedItem.GetType().GetProperty("LastRefreshTime");
-                    var refreshIntervalProperty = cachedItem.GetType().GetProperty("RefreshInterval");
-                    var isRefreshingProperty = cachedItem.GetType().GetProperty("IsRefreshing");
-                    var refreshStartTimeProperty = cachedItem.GetType().GetProperty("RefreshStartTime");
-                    var lastRefreshAttemptProperty = cachedItem.GetType().GetProperty("LastRefreshAttempt");
-                    var populateMethodProperty = cachedItem.GetType().GetProperty("PopulateMethod");
-                    var absoluteExpirationProperty = cachedItem.GetType().GetProperty("AbsoluteExpiration");
-                    var slidingExpirationProperty = cachedItem.GetType().GetProperty("SlidingExpiration");
-
-                    var actualItem = itemProperty?.GetValue(cachedItem);
-                    if (actualItem == null) return null;
-
-                    // Get populate method name
-                    var populateMethod = populateMethodProperty?.GetValue(cachedItem) as Delegate;
-                    var populateMethodName = GetMethodName(populateMethod);
-
-                    var lastRefreshTime = (DateTime)(lastRefreshTimeProperty?.GetValue(cachedItem) ?? DateTime.MinValue);
-                    var refreshInterval = (TimeSpan)(refreshIntervalProperty?.GetValue(cachedItem) ?? TimeSpan.Zero);
-                    var absoluteExpiration = (DateTime)(absoluteExpirationProperty?.GetValue(cachedItem) ?? DateTime.MaxValue);
-                    var slidingExpiration = (TimeSpan)(slidingExpirationProperty?.GetValue(cachedItem) ?? TimeSpan.Zero);
-
                     var metadata = new CacheItemMetadata
                     {
-                        CacheKey = originalKey,
+                        CacheKey = ci.CacheKey,
                         GroupName = groupName,
-                        DataType = actualItem.GetType().Name,
-                        EstimatedMemorySize = EstimateObjectSize(actualItem),
-                        LastRefreshTime = lastRefreshTime,
-                        RefreshInterval = refreshInterval,
-                        IsRefreshing = (bool)(isRefreshingProperty?.GetValue(cachedItem) ?? false),
-                        RefreshStartTime = (DateTime?)(refreshStartTimeProperty?.GetValue(cachedItem)),
-                        LastRefreshAttempt = (DateTime?)(lastRefreshAttemptProperty?.GetValue(cachedItem)),
-                        CollectionCount = GetCollectionCount(actualItem),
-                        PopulateMethodName = populateMethodName,
-                        NextRefreshTime = CalculateNextRefreshTime(lastRefreshTime, refreshInterval),
-                        PersistentCacheEnabled = _persistentOptions != null,
-                        AbsoluteExpiration = absoluteExpiration,
-                        SlidingExpiration = slidingExpiration
+                        DataType = ci.DataType?.Name ?? ci.ItemBoxed?.GetType().Name,
+                        EstimatedMemorySize = ci.CachedEstimatedSize ?? EstimateObjectSize(ci.ItemBoxed),
+                        LastRefreshTime = ci.LastRefreshTime,
+                        RefreshInterval = ci.RefreshInterval,
+                        IsRefreshing = ci.IsRefreshing,
+                        RefreshStartTime = ci.RefreshStartTime,
+                        LastRefreshAttempt = ci.LastRefreshAttempt,
+                        CollectionCount = GetCollectionCount(ci.ItemBoxed),
+                        PopulateMethodName = ci.PopulateMethodName,
+                        NextRefreshTime = CalculateNextRefreshTime(ci.LastRefreshTime, ci.RefreshInterval),
+                        PersistentCacheEnabled = persistentEnabled,
+                        AbsoluteExpiration = ci.AbsoluteExpiration,
+                        SlidingExpiration = ci.SlidingExpiration
                     };
-
-                    // Add persistent cache information
                     PopulatePersistentCacheMetadata(metadata, fullCacheKey);
-
                     return metadata;
                 }
-                else
+
+                // Fallback: an object cached directly without the CacheItem wrapper.
+                var originalKey = fullCacheKey.Length > groupName.Length + 1
+                    ? fullCacheKey.Substring(groupName.Length + 1)
+                    : fullCacheKey;
+                var directMetadata = new CacheItemMetadata
                 {
-                    // Direct cached object (not wrapped in CacheItem<T>)
-                    var metadata = new CacheItemMetadata
-                    {
-                        CacheKey = originalKey,
-                        GroupName = groupName,
-                        DataType = cachedItem.GetType().Name,
-                        EstimatedMemorySize = EstimateObjectSize(cachedItem),
-                        LastRefreshTime = DateTime.MinValue, // Unknown for direct cached items
-                        RefreshInterval = TimeSpan.Zero,
-                        IsRefreshing = false,
-                        CollectionCount = GetCollectionCount(cachedItem),
-                        PopulateMethodName = null, // Unknown for direct cached items
-                        NextRefreshTime = null, // No refresh for direct cached items
-                        PersistentCacheEnabled = _persistentOptions != null,
-                        AbsoluteExpiration = DateTime.MaxValue, // Unknown for direct cached items
-                        SlidingExpiration = TimeSpan.Zero // Unknown for direct cached items
-                    };
-
-                    // Add persistent cache information
-                    PopulatePersistentCacheMetadata(metadata, fullCacheKey);
-
-                    return metadata;
-                }
+                    CacheKey = originalKey,
+                    GroupName = groupName,
+                    DataType = cachedItem.GetType().Name,
+                    EstimatedMemorySize = EstimateObjectSize(cachedItem),
+                    LastRefreshTime = DateTime.MinValue,
+                    RefreshInterval = TimeSpan.Zero,
+                    IsRefreshing = false,
+                    CollectionCount = GetCollectionCount(cachedItem),
+                    PopulateMethodName = null,
+                    NextRefreshTime = null,
+                    PersistentCacheEnabled = persistentEnabled,
+                    AbsoluteExpiration = DateTime.MaxValue,
+                    SlidingExpiration = TimeSpan.Zero
+                };
+                PopulatePersistentCacheMetadata(directMetadata, fullCacheKey);
+                return directMetadata;
             }
-            catch (Exception)
+            catch
             {
-                // If we can't process the item, return null
                 return null;
             }
         }
 
-        /// <summary>
-        /// Estimates the memory size of an object using JSON serialization
-        /// </summary>
-        /// <param name="obj">Object to estimate size for</param>
-        /// <returns>Estimated size in bytes</returns>
         private static long EstimateObjectSize(object obj)
         {
             if (obj == null) return 0;
 
             try
             {
-                // Use JSON serialization as a rough estimate of object size
                 var json = JsonSerializer.Serialize(obj, CacheJsonOptions);
                 return System.Text.Encoding.UTF8.GetByteCount(json);
             }
             catch
             {
-                // Fallback: basic size estimation for common types
                 return obj switch
                 {
-                    string str => str.Length * 2, // Unicode characters are 2 bytes
+                    string str => str.Length * 2,
                     int => 4,
                     long => 8,
                     double => 8,
                     float => 4,
                     bool => 1,
                     DateTime => 8,
-                    _ => 64 // Default estimate for unknown types
+                    _ => 64
                 };
             }
         }
 
-        /// <summary>
-        /// Gets the count of items in a collection, if applicable
-        /// </summary>
-        /// <param name="obj">Object to check</param>
-        /// <returns>Count if object is a collection, null otherwise</returns>
         private static int? GetCollectionCount(object obj)
         {
             if (obj == null) return null;
+            if (obj is ICollection collection) return collection.Count;
 
-            // Check if object implements ICollection (most collections do)
-            if (obj is ICollection collection)
-            {
-                return collection.Count;
-            }
-
-            // Check for IEnumerable as fallback (but this requires enumeration)
-            if (obj is IEnumerable enumerable && !(obj is string)) // string is IEnumerable but we don't want to count characters
+            if (obj is IEnumerable enumerable && !(obj is string))
             {
                 try
                 {
@@ -1571,22 +1403,16 @@ namespace CacheUtility
                 }
                 catch
                 {
-                    // If enumeration fails, return null
                     return null;
                 }
             }
-
             return null;
         }
 
-        /// <summary>
-        /// Populates persistent cache metadata for a cache item
-        /// </summary>
-        /// <param name="metadata">Metadata object to populate</param>
-        /// <param name="fullCacheKey">Full cache key including group prefix</param>
         private static void PopulatePersistentCacheMetadata(CacheItemMetadata metadata, string fullCacheKey)
         {
-            if (_persistentOptions == null)
+            var options = _persistentOptions;
+            if (options == null)
             {
                 metadata.IsPersisted = false;
                 return;
@@ -1596,7 +1422,6 @@ namespace CacheUtility
             {
                 var cacheFilePath = GetPersistentCacheFilePath(fullCacheKey);
                 var metaFilePath = GetPersistentCacheMetaFilePath(fullCacheKey);
-
                 metadata.IsPersisted = File.Exists(cacheFilePath) && File.Exists(metaFilePath);
 
                 if (metadata.IsPersisted)
@@ -1627,46 +1452,27 @@ namespace CacheUtility
             }
         }
 
-        /// <summary>
-        /// Calculates the next refresh time based on last refresh time and refresh interval
-        /// </summary>
-        /// <param name="lastRefreshTime">When the item was last refreshed</param>
-        /// <param name="refreshInterval">Auto-refresh interval</param>
-        /// <returns>Next refresh time, or null if no auto-refresh is configured</returns>
         private static DateTime? CalculateNextRefreshTime(DateTime lastRefreshTime, TimeSpan refreshInterval)
         {
-            if (refreshInterval <= TimeSpan.Zero || lastRefreshTime == DateTime.MinValue)
-            {
-                return null; // No auto-refresh configured
-            }
-
+            if (refreshInterval <= TimeSpan.Zero || lastRefreshTime == DateTime.MinValue) return null;
             return lastRefreshTime.Add(refreshInterval);
         }
 
-        /// <summary>
-        /// Extracts the method name from a delegate
-        /// </summary>
-        /// <param name="method">The delegate to extract name from</param>
-        /// <returns>Method name or null if not available</returns>
-        private static string GetMethodName(Delegate method)
+        internal static string GetMethodName(Delegate method)
         {
             if (method == null) return null;
-
             try
             {
-                // Check if it's a simple method (not lambda or anonymous)
                 if (method.Method != null)
                 {
                     var methodInfo = method.Method;
 
-                    // Skip compiler-generated methods (lambdas, anonymous methods)
                     if (methodInfo.Name.Contains("<") || methodInfo.Name.Contains("lambda") ||
                         methodInfo.Name.Contains("Anonymous") || methodInfo.DeclaringType?.Name.Contains("<>") == true)
                     {
                         return "[Lambda/Anonymous]";
                     }
 
-                    // For regular methods, return ClassName.MethodName
                     if (methodInfo.DeclaringType != null)
                     {
                         return $"{methodInfo.DeclaringType.Name}.{methodInfo.Name}";
@@ -1677,214 +1483,236 @@ namespace CacheUtility
             }
             catch
             {
-                // If we can't determine the method name, return null
+                // ignore
+            }
+            return null;
+        }
+
+        // =====================================================================
+        // CacheItem<T>
+        // =====================================================================
+
+        /// <summary>
+        /// Cache item wrapper.
+        /// </summary>
+        [Serializable]
+        public class CacheItem<T> : ICacheItem
+        {
+            [NonSerialized]
+            private Func<T> _populateMethod;
+
+            [NonSerialized]
+            private Timer _refreshTimer;
+
+            [NonSerialized]
+            private Task _refreshTask;
+
+            // Note: do NOT initialize via field initializer here. After deserialization,
+            // field initializers do not run; we lazily initialize in the property accessor below.
+            [NonSerialized]
+            private object _refreshLock;
+
+            [NonSerialized]
+            private long? _cachedEstimatedSize;
+
+            /// <summary>
+            /// Cached item.
+            /// </summary>
+            public T Item { get; set; }
+
+            /// <summary>
+            /// The last time this cache item was refreshed.
+            /// </summary>
+            public DateTime LastRefreshTime { get; set; }
+
+            /// <summary>
+            /// The refresh interval for this cache item.
+            /// </summary>
+            public TimeSpan RefreshInterval { get; set; }
+
+            /// <summary>
+            /// Cache key for this item (used in refresh callbacks).
+            /// </summary>
+            public string CacheKey { get; set; }
+
+            /// <summary>
+            /// Group name for this item (used in refresh callbacks).
+            /// </summary>
+            public string GroupName { get; set; }
+
+            /// <summary>
+            /// Indicates if a refresh operation is currently in progress.
+            /// </summary>
+            public bool IsRefreshing { get; set; }
+
+            /// <summary>
+            /// When the current refresh operation started.
+            /// </summary>
+            public DateTime RefreshStartTime { get; set; }
+
+            /// <summary>
+            /// The last time a refresh was attempted (regardless of success).
+            /// </summary>
+            public DateTime LastRefreshAttempt { get; set; }
+
+            /// <summary>
+            /// Absolute expiration date for this cache item.
+            /// </summary>
+            public DateTime AbsoluteExpiration { get; set; }
+
+            /// <summary>
+            /// Sliding expiration duration for this cache item.
+            /// </summary>
+            public TimeSpan SlidingExpiration { get; set; }
+
+            /// <summary>
+            /// The populate method used to refresh this cache item.
+            /// </summary>
+            public Func<T> PopulateMethod
+            {
+                get => _populateMethod;
+                set => _populateMethod = value;
             }
 
-            return null;
+            /// <summary>
+            /// Internal alias used by the cache infrastructure to read/write the populate method
+            /// without triggering serialization-time hooks.
+            /// </summary>
+            internal Func<T> PopulateMethodCache
+            {
+                get => _populateMethod;
+                set => _populateMethod = value;
+            }
+
+            /// <summary>
+            /// Timer for automatic refresh.
+            /// </summary>
+            public Timer RefreshTimer
+            {
+                get => _refreshTimer;
+                set => _refreshTimer = value;
+            }
+
+            /// <summary>
+            /// Current refresh task.
+            /// </summary>
+            public Task RefreshTask
+            {
+                get => _refreshTask;
+                set => _refreshTask = value;
+            }
+
+            /// <summary>
+            /// Lock for refresh state operations. Lazily initialized in a thread-safe manner so that
+            /// a single shared monitor is returned across all calls (including post-deserialization).
+            /// </summary>
+            public object RefreshLock => LazyInitializer.EnsureInitialized(ref _refreshLock, () => new object());
+
+            /// <summary>
+            /// Recompute and cache the estimated serialized size for the current value.
+            /// Called once on populate / refresh to avoid serializing on every metadata read.
+            /// </summary>
+            internal void RecomputeEstimatedSize()
+            {
+                if (Item == null)
+                {
+                    _cachedEstimatedSize = 0;
+                    return;
+                }
+
+                try
+                {
+                    var json = JsonSerializer.Serialize(Item);
+                    _cachedEstimatedSize = System.Text.Encoding.UTF8.GetByteCount(json);
+                }
+                catch
+                {
+                    _cachedEstimatedSize = null;
+                }
+            }
+
+            // ===== ICacheItem (internal type-erased view) =====
+
+            object ICacheItem.ItemBoxed => Item;
+            string ICacheItem.PopulateMethodName => Cache.GetMethodName(_populateMethod);
+            long? ICacheItem.CachedEstimatedSize => _cachedEstimatedSize;
+            Type ICacheItem.DataType => typeof(T);
+
+            /// <summary>
+            /// Dispose of the refresh timer when cache item is disposed.
+            /// </summary>
+            public void Dispose()
+            {
+                _refreshTimer?.Dispose();
+                _refreshTimer = null;
+            }
         }
     }
 
     /// <summary>
-    /// Metadata information about a cached item
+    /// Metadata information about a cached item.
     /// </summary>
     public class CacheItemMetadata
     {
-        /// <summary>
-        /// Original cache key (without group prefix)
-        /// </summary>
         public string CacheKey { get; set; }
-
-        /// <summary>
-        /// Cache group name
-        /// </summary>
         public string GroupName { get; set; }
-
-        /// <summary>
-        /// Type name of the cached object
-        /// </summary>
         public string DataType { get; set; }
-
-        /// <summary>
-        /// Estimated memory usage in bytes
-        /// </summary>
         public long EstimatedMemorySize { get; set; }
-
-        /// <summary>
-        /// When the data was last refreshed
-        /// </summary>
         public DateTime LastRefreshTime { get; set; }
-
-        /// <summary>
-        /// When the last refresh was attempted (regardless of success)
-        /// </summary>
         public DateTime? LastRefreshAttempt { get; set; }
-
-        /// <summary>
-        /// Auto-refresh interval
-        /// </summary>
         public TimeSpan RefreshInterval { get; set; }
-
-        /// <summary>
-        /// Whether a refresh operation is currently in progress
-        /// </summary>
         public bool IsRefreshing { get; set; }
-
-        /// <summary>
-        /// When the current refresh operation started
-        /// </summary>
         public DateTime? RefreshStartTime { get; set; }
-
-        /// <summary>
-        /// Count of items if the cached object is a collection
-        /// </summary>
         public int? CollectionCount { get; set; }
-
-        /// <summary>
-        /// Name of the populate method used to create/refresh this cache item
-        /// </summary>
         public string PopulateMethodName { get; set; }
 
-
-
-        /// <summary>
-        /// Whether this item is persisted to disk
-        /// </summary>
         public bool IsPersisted { get; set; }
-
-        /// <summary>
-        /// File path of the persistent cache file (if persisted)
-        /// </summary>
         public string PersistentFilePath { get; set; } = string.Empty;
-
-        /// <summary>
-        /// Size of the persistent cache file in bytes (if persisted)
-        /// </summary>
         public long PersistentFileSize { get; set; }
-
-        /// <summary>
-        /// When the item was last persisted to disk
-        /// </summary>
         public DateTime? LastPersistedTime { get; set; }
-
-        /// <summary>
-        /// When the next refresh is scheduled to occur (if auto-refresh is enabled)
-        /// </summary>
         public DateTime? NextRefreshTime { get; set; }
-
-        /// <summary>
-        /// Whether persistent cache is enabled for this item
-        /// </summary>
         public bool PersistentCacheEnabled { get; set; }
-
-        /// <summary>
-        /// Path to the metadata file for persistent cache (if persisted)
-        /// </summary>
         public string PersistentMetaFilePath { get; set; } = string.Empty;
-
-        /// <summary>
-        /// Size of the persistent metadata file in bytes (if persisted)
-        /// </summary>
         public long PersistentMetaFileSize { get; set; }
 
-        /// <summary>
-        /// Total size of both cache and metadata files in bytes (if persisted)
-        /// </summary>
         public long TotalPersistentSize => PersistentFileSize + PersistentMetaFileSize;
-
-        /// <summary>
-        /// Age of the persistent cache file (time since last write)
-        /// </summary>
         public TimeSpan? PersistentFileAge => LastPersistedTime.HasValue ? DateTime.Now - LastPersistedTime.Value : null;
 
-        /// <summary>
-        /// Absolute expiration date for this cache item
-        /// </summary>
         public DateTime AbsoluteExpiration { get; set; }
-
-        /// <summary>
-        /// Sliding expiration duration for this cache item
-        /// </summary>
         public TimeSpan SlidingExpiration { get; set; }
 
-        /// <summary>
-        /// Whether the cache item has an absolute expiration set
-        /// </summary>
         public bool HasAbsoluteExpiration => AbsoluteExpiration != DateTime.MaxValue && AbsoluteExpiration != default;
-
-        /// <summary>
-        /// Whether the cache item has a sliding expiration set
-        /// </summary>
         public bool HasSlidingExpiration => SlidingExpiration > TimeSpan.Zero;
-
-        /// <summary>
-        /// Time remaining until absolute expiration (null if no absolute expiration)
-        /// </summary>
         public TimeSpan? TimeUntilExpiration => HasAbsoluteExpiration ? AbsoluteExpiration - DateTime.Now : null;
-
-        /// <summary>
-        /// Whether the cache item is currently expired based on absolute expiration
-        /// </summary>
         public bool IsExpired => HasAbsoluteExpiration && DateTime.Now > AbsoluteExpiration;
     }
 
     /// <summary>
-    /// Configuration options for persistent cache
+    /// Configuration options for persistent cache.
     /// </summary>
     public class PersistentCacheOptions
     {
-        /// <summary>
-        /// Base directory for persistent cache files
-        /// </summary>
         public string BaseDirectory { get; set; }
-
-        /// <summary>
-        /// Maximum file size for cached items (0 = no limit)
-        /// </summary>
         public long MaxFileSize { get; set; }
-
-        /// <summary>
-        /// Array of cache group names that should be persisted to disk.
-        /// If null or empty, no cache groups will be persisted.
-        /// If specified, only cache groups in this array will be persisted.
-        /// </summary>
         public string[] PersistentGroups { get; set; }
 
-        /// <summary>
-        /// Internal HashSet for efficient lookup of persistent groups (case-insensitive).
-        /// Automatically populated from PersistentGroups array.
-        /// </summary>
         internal HashSet<string> _persistentGroupsSet { get; private set; }
 
-        /// <summary>
-        /// Default constructor with sensible defaults
-        /// </summary>
         public PersistentCacheOptions()
         {
             BaseDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CacheUtility");
-            MaxFileSize = 10 * 1024 * 1024; // 10MB default limit
-            PersistentGroups = new string[0]; // empty array means persist nothing by default
+            MaxFileSize = 10 * 1024 * 1024;
+            PersistentGroups = Array.Empty<string>();
             UpdatePersistentGroupsSet();
         }
 
-        /// <summary>
-        /// Updates the internal HashSet when PersistentGroups changes
-        /// </summary>
         public void UpdatePersistentGroupsSet()
         {
-            if (PersistentGroups == null || PersistentGroups.Length == 0)
-            {
-                _persistentGroupsSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase); // empty set means persist nothing
-            }
-            else
-            {
-                _persistentGroupsSet = new HashSet<string>(PersistentGroups, StringComparer.OrdinalIgnoreCase);
-            }
+            _persistentGroupsSet = (PersistentGroups == null || PersistentGroups.Length == 0)
+                ? new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                : new HashSet<string>(PersistentGroups, StringComparer.OrdinalIgnoreCase);
         }
 
-        /// <summary>
-        /// Sets the persistent groups and updates the internal HashSet
-        /// </summary>
-        /// <param name="groups">Array of group names to persist</param>
         public void SetPersistentGroups(params string[] groups)
         {
             PersistentGroups = groups;
@@ -1893,81 +1721,40 @@ namespace CacheUtility
     }
 
     /// <summary>
-    /// Persistent cache item for serialization
+    /// Persistent cache item for serialization.
     /// </summary>
-    /// <typeparam name="T">Cached item type</typeparam>
     [Serializable]
     public class PersistentCacheItem<T>
     {
-        /// <summary>
-        /// Cached item
-        /// </summary>
         public T Item { get; set; }
-
-        /// <summary>
-        /// The last time this cache item was refreshed
-        /// </summary>
         public DateTime LastRefreshTime { get; set; }
-
-        /// <summary>
-        /// Cache key for this item
-        /// </summary>
         public string CacheKey { get; set; }
-
-        /// <summary>
-        /// Group name for this item
-        /// </summary>
         public string GroupName { get; set; }
     }
 
     /// <summary>
-    /// Persistent cache metadata for expiration tracking
+    /// Persistent cache metadata for expiration tracking.
     /// </summary>
     [Serializable]
     public class PersistentCacheMetadata
     {
-        /// <summary>
-        /// When the cache item was created
-        /// </summary>
         public DateTime CreatedTime { get; set; }
-
-        /// <summary>
-        /// Absolute expiration date
-        /// </summary>
         public DateTime AbsoluteExpiration { get; set; }
-
-        /// <summary>
-        /// Sliding expiration duration
-        /// </summary>
         public TimeSpan SlidingExpiration { get; set; }
-
-        /// <summary>
-        /// Last time the cache item was accessed
-        /// </summary>
         public DateTime LastAccessTime { get; set; }
 
-        /// <summary>
-        /// Check if the cache item is expired
-        /// </summary>
-        /// <returns>True if expired, false otherwise</returns>
         public bool IsExpired()
         {
             var now = DateTime.Now;
 
-            // Check absolute expiration
             if (AbsoluteExpiration != DateTime.MaxValue && now > AbsoluteExpiration)
             {
                 return true;
             }
 
-            // Check sliding expiration
             if (SlidingExpiration > TimeSpan.Zero)
             {
-                var timeSinceLastAccess = now - LastAccessTime;
-                if (timeSinceLastAccess > SlidingExpiration)
-                {
-                    return true;
-                }
+                if (now - LastAccessTime > SlidingExpiration) return true;
             }
 
             return false;
@@ -1975,83 +1762,26 @@ namespace CacheUtility
     }
 
     /// <summary>
-    /// Statistics about persistent cache usage
+    /// Statistics about persistent cache usage.
     /// </summary>
     public class PersistentCacheStatistics
     {
-        /// <summary>
-        /// Whether persistent cache is enabled
-        /// </summary>
         public bool IsEnabled { get; set; }
-
-        /// <summary>
-        /// Base directory for persistent cache files
-        /// </summary>
         public string BaseDirectory { get; set; } = string.Empty;
-
-        /// <summary>
-        /// Total number of files in cache directory
-        /// </summary>
         public int TotalFiles { get; set; }
-
-        /// <summary>
-        /// Total size of all cache files in bytes
-        /// </summary>
         public long TotalSizeBytes { get; set; }
-
-        /// <summary>
-        /// Number of cache data files
-        /// </summary>
         public int CacheFiles { get; set; }
-
-        /// <summary>
-        /// Number of metadata files
-        /// </summary>
         public int MetaFiles { get; set; }
-
-        /// <summary>
-        /// When the oldest cache file was created
-        /// </summary>
         public DateTime? OldestFileTime { get; set; }
-
-        /// <summary>
-        /// When the newest cache file was created
-        /// </summary>
         public DateTime? NewestFileTime { get; set; }
-
-        /// <summary>
-        /// Average file size in bytes
-        /// </summary>
         public long AverageFileSize => TotalFiles > 0 ? TotalSizeBytes / TotalFiles : 0;
-
-        /// <summary>
-        /// Size of the largest file in bytes
-        /// </summary>
         public long LargestFileSize { get; set; }
-
-        /// <summary>
-        /// Size of the smallest file in bytes
-        /// </summary>
         public long SmallestFileSize { get; set; }
-
-        /// <summary>
-        /// Number of orphaned files (cache files without corresponding metadata files, or vice versa)
-        /// </summary>
         public int OrphanedFiles { get; set; }
 
-        /// <summary>
-        /// Age of the persistent cache directory (oldest file age)
-        /// </summary>
         public TimeSpan? DirectoryAge => OldestFileTime.HasValue ? DateTime.Now - OldestFileTime.Value : null;
-
-        /// <summary>
-        /// Time since last cache activity (newest file age)
-        /// </summary>
         public TimeSpan? TimeSinceLastActivity => NewestFileTime.HasValue ? DateTime.Now - NewestFileTime.Value : null;
 
-        /// <summary>
-        /// Total size formatted as human-readable string
-        /// </summary>
         public string TotalSizeFormatted
         {
             get
@@ -2063,9 +1793,6 @@ namespace CacheUtility
             }
         }
 
-        /// <summary>
-        /// Average file size formatted as human-readable string
-        /// </summary>
         public string AverageFileSizeFormatted
         {
             get
@@ -2079,4 +1806,3 @@ namespace CacheUtility
         }
     }
 }
-

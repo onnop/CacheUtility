@@ -11,13 +11,16 @@ A thread-safe, generic wrapper for System.Runtime.Caching that simplifies cache 
 
 CacheUtility provides an easy-to-use abstraction over the standard .NET memory cache with additional features:
 
-- **Automatic cache population** with custom populate methods
+- **Automatic cache population** with custom populate methods (sync or async)
+- **First-class async support** with `GetAsync` and single-flight populate de-duplication
 - **Various expiration strategies** (sliding and absolute)
-- **Thread-safe operations** with minimal lock contention
+- **Thread-safe, lock-free hot paths** powered by `ConcurrentDictionary` and `Lazy<T>` populate dedup
 - **Support for cache groups** for organized data management
-- **Dependency relationships** between cache groups
+- **Strongly-typed bulk access** via `GetAllByGroup<T>()` — no boxing, no reflection
+- **Peek without populating** via `TryGet<T>()` for cache-only lookups
+- **Dependency relationships** between cache groups (cycle-safe)
 - **Automatic background refresh** functionality for non-blocking updates
-- **Persistent cache storage** for data that survives application restarts
+- **Persistent cache storage** with atomic file writes that survives application restarts
 - **Comprehensive metadata and monitoring** for cache analysis and debugging
 - **Built-in diagnostic logging** with `services.AddCacheLogging()` — zero-config DI integration
 
@@ -37,7 +40,7 @@ dotnet add package CacheUtility
 
 ### PackageReference
 ```xml
-<PackageReference Include="CacheUtility" Version="1.3.5" />
+<PackageReference Include="CacheUtility" Version="1.4.0" />
 ```
 
 ## Quick Start
@@ -121,14 +124,49 @@ var settings = Cache.Get("GlobalSettings", "AppConfig", DateTime.Now.AddHours(12
 
 ### Async operations
 
-For async operations, you can use the utility with async/await:
+When your populate method performs I/O (database, HTTP, file access), use `GetAsync` instead of the
+synchronous `Get`. This avoids blocking the calling thread while the value is being produced, and it
+shares a single in-flight populate `Task` across all concurrent callers for the same key.
 
 ```csharp
-var result = await Cache.Get("MyKey", "MyGroupName", async () => 
-{
-    return await MyLongRunningTaskAsync();
-});
+// Async populate — 30-minute sliding default
+var user = await Cache.GetAsync($"user_{id}", "users", () => userRepo.LoadAsync(id));
+
+// Async populate with explicit sliding expiration
+var weather = await Cache.GetAsync($"weather_{cityId}", "WeatherCache",
+    TimeSpan.FromHours(2),
+    () => weatherApi.GetCurrentWeatherAsync(cityId));
+
+// Async populate with cancellation
+using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+var report = await Cache.GetAsync("dailyReport", "reports",
+    () => reportService.GenerateAsync(),
+    cancellationToken: cts.Token);
 ```
+
+**Notes**:
+- Cancellation only cancels the awaiting caller — other waiters on the same in-flight populate continue.
+- A failed populate (`Task` faults) is not cached. The next call retries.
+- Mixing sync `Get` and `GetAsync` for the same key is allowed but generally not recommended.
+
+### Peeking without populating
+
+Use `TryGet<T>` when you want to check whether an item is currently in the in-memory cache **without**
+invoking the populate method.
+
+```csharp
+if (Cache.TryGet<Session>($"session_{token}", "sessions", out var session))
+{
+    // Cache had it - use 'session' directly
+}
+else
+{
+    // Not cached - decide whether to populate now or skip
+}
+```
+
+`TryGet` does not consult persistent storage. It returns `false` if the item is missing or if its
+stored type does not match `T`.
 
 ## Cache management
 
@@ -159,20 +197,35 @@ Cache.RemoveGroup("GroupA", "GroupB", "GroupC");
 Get all cached items that belong to a specific group:
 
 ```csharp
+// Non-generic - returns Dictionary<string, object>
 var allItems = Cache.GetAllByGroup("MyGroupName");
 
-// Iterate through all items in the group
 foreach (var kvp in allItems)
 {
     Console.WriteLine($"Key: {kvp.Key}, Value: {kvp.Value}");
 }
 
-// Access specific items if you know the key
 if (allItems.ContainsKey("MySpecificKey"))
 {
     var specificItem = allItems["MySpecificKey"];
 }
 ```
+
+When all items in the group share a known type, prefer the strongly-typed overload. It avoids boxing
+and the cast-per-item cost at the call site:
+
+```csharp
+// Generic - returns Dictionary<string, User> directly
+Dictionary<string, User> users = Cache.GetAllByGroup<User>("UserProfiles");
+
+foreach (var (key, user) in users)
+{
+    Console.WriteLine($"{key}: {user.DisplayName}");
+}
+```
+
+Items in the group whose stored type does not match `T` are silently skipped, which makes the typed
+overload safe to use against heterogeneous groups.
 
 ## Persistent Cache
 
@@ -760,11 +813,14 @@ Cache.RemoveGroup("UserData");
 **Solutions**:
 1. **Check if you're blocking on populate methods**:
    ```csharp
-   // Bad - synchronous database call
+   // Bad - synchronous database call from an async context
    var data = Cache.Get("key", "group", () => database.GetData());
-   
-   // Better - use async populate methods when available
+
+   // Worse - blocking on a Task with .Result deadlocks in some sync contexts
    var data = Cache.Get("key", "group", () => GetDataAsync().Result);
+
+   // Best - use GetAsync with an async populate method
+   var data = await Cache.GetAsync("key", "group", () => GetDataAsync());
    ```
 
 2. **Monitor cache hit rates**:
@@ -849,18 +905,26 @@ If you encounter issues not covered here:
 
 ## Performance considerations
 
-- The CacheUtility uses locks to ensure thread safety, but is designed to minimize lock contention.
-- Populate methods are only called once per cache miss, even under high concurrency.
-- **Refresh operations are non-blocking**: Cache calls return immediately with existing data, even during background refresh.
-- Background refresh uses `Task.Run()` to prevent blocking the main thread.
-- Multiple concurrent refresh requests for the same cache key are automatically deduplicated.
+- Cache lookups are lock-free on the hot path. Group membership and dependency tracking use
+  `ConcurrentDictionary`; populate de-duplication uses `Lazy<T>` (sync) and shared `Task<T>` (async).
+- Populate methods are called **once per cache miss**, even under heavy concurrency. Other callers
+  for the same key block on the same `Lazy<T>` / `Task<T>` rather than running the populate again.
+- **Refresh operations are non-blocking**: cache calls return immediately with existing data, even
+  while a background refresh is running.
+- Background refresh uses `Task.Run()` and a per-item refresh lock so duplicate refreshes for the
+  same key are suppressed.
+- Metadata and size estimation avoid reflection on the hot path via an internal `ICacheItem`
+  abstraction; `EstimatedMemorySize` is computed once and cached.
+- Sliding-expiration "touch" writes to persistent storage are throttled to at most once per minute
+  per item to avoid disk thrash on hot reads.
+- Persistent files are written atomically (`.tmp` + `File.Move`) so a crash mid-write cannot leave a
+  half-written `.cache` file.
 - Consider memory usage when caching large objects or collections.
 - **Persistent cache performance**:
-  - Memory cache remains the primary storage for optimal performance
-  - File I/O operations are performed asynchronously when possible
-  - JSON serialization overhead is minimal for most data types
-  - Disk storage provides fallback without impacting memory cache speed
-  - Background cleanup runs periodically without blocking cache operations
+  - Memory cache remains the primary storage for optimal performance.
+  - JSON serialization overhead is minimal for most data types.
+  - Background cleanup uses a `LastWriteTime` pre-filter so unexpired files are not parsed.
+  - Orphaned `.cache` files (no matching `.meta`) are reclaimed by the same cleanup pass.
 
 ## When to use cache groups vs. key prefixes
 
@@ -871,43 +935,87 @@ If you encounter issues not covered here:
 
 ### Core Cache Operations
 
-#### Get Methods
+#### Get methods (synchronous)
 ```csharp
-// Basic get with populate method
-T Get<T>(string cacheKey, string groupName, Func<T> populateMethod)
+// Basic get with populate method (default 30-minute sliding expiration)
+T Get<T>(string cacheKey, string groupName, Func<T> populateMethod, TimeSpan refresh = default)
 
 // Get with sliding expiration
-T Get<T>(string cacheKey, string groupName, TimeSpan slidingExpiration, Func<T> populateMethod)
+T Get<T>(string cacheKey, string groupName, TimeSpan slidingExpiration,
+         Func<T> populateMethod, TimeSpan refresh = default)
 
 // Get with absolute expiration
-T Get<T>(string cacheKey, string groupName, DateTime absoluteExpiration, Func<T> populateMethod)
+T Get<T>(string cacheKey, string groupName, DateTime absoluteExpiration,
+         Func<T> populateMethod, TimeSpan refresh = default)
 
-// Get with auto-refresh
-T Get<T>(string cacheKey, string groupName, TimeSpan slidingExpiration, Func<T> populateMethod, TimeSpan refresh)
-
-// Get with callback
-T Get<T>(string cacheKey, string groupName, TimeSpan slidingExpiration, Func<T> populateMethod, CacheEntryRemovedCallback removedCallback)
+// Full overload (priority + removed callback)
+T Get<T>(string cacheKey, string groupName,
+         DateTime absoluteExpiration, TimeSpan slidingExpiration,
+         CacheItemPriority priority, Func<T> populateMethod,
+         CacheEntryRemovedCallback removedCallback = null,
+         TimeSpan refresh = default)
 ```
 
-#### Remove Methods
+#### GetAsync methods (asynchronous, NEW in 1.4.0)
+```csharp
+// Default 30-minute sliding expiration
+Task<T> GetAsync<T>(string cacheKey, string groupName, Func<Task<T>> populateMethod,
+                    TimeSpan refresh = default, CancellationToken cancellationToken = default)
+
+// Sliding expiration
+Task<T> GetAsync<T>(string cacheKey, string groupName, TimeSpan slidingExpiration,
+                    Func<Task<T>> populateMethod,
+                    TimeSpan refresh = default, CancellationToken cancellationToken = default)
+
+// Absolute expiration
+Task<T> GetAsync<T>(string cacheKey, string groupName, DateTime absoluteExpiration,
+                    Func<Task<T>> populateMethod,
+                    TimeSpan refresh = default, CancellationToken cancellationToken = default)
+
+// Full overload
+Task<T> GetAsync<T>(string cacheKey, string groupName,
+                    DateTime absoluteExpiration, TimeSpan slidingExpiration,
+                    CacheItemPriority priority, Func<Task<T>> populateMethod,
+                    CacheEntryRemovedCallback removedCallback = null,
+                    TimeSpan refresh = default, CancellationToken cancellationToken = default)
+```
+
+#### TryGet (NEW in 1.4.0)
+```csharp
+// Returns true if the item is in the in-memory cache; never invokes populate.
+bool TryGet<T>(string cacheKey, string groupName, out T value)
+```
+
+#### Remove methods
 ```csharp
 // Remove single item
 void Remove(string cacheKey, string groupName)
 
-// Remove entire group
-void RemoveGroup(string groupName)
+// Remove every item in the group whose original key contains all the supplied snippets
+void Remove(List<string> cacheKeys, string groupName)
+
+// Remove one or more entire groups (cycle-safe with respect to dependencies)
+void RemoveGroup(params string[] groupNames)
+
+// Remove every item except those in the supplied groups
+void RemoveAllButThese(List<string> excludedGroupNames)
 
 // Remove all cache items
 void RemoveAll()
 ```
 
-#### Group Operations
+#### Group operations
 ```csharp
-// Get all items from a group
-IEnumerable<T> GetAllByGroup<T>(string groupName)
+// Get all items from a group as Dictionary<string, object>
+Dictionary<string, object> GetAllByGroup(string groupName)
 
-// Add dependency between groups
-void AddGroupDependency(string dependentGroup, string parentGroup)
+// Get all items from a group as Dictionary<string, T> (NEW in 1.4.0)
+// Items whose stored type does not match T are skipped.
+Dictionary<string, T> GetAllByGroup<T>(string groupName)
+
+// Set (or replace) the dependent groups for the given group.
+// When the group is removed, dependent groups are removed too.
+void SetDependencies(string groupName, params string[] dependencies)
 ```
 
 ### Persistent Cache Operations
@@ -1028,46 +1136,49 @@ public class PersistentCacheOptions
 {
     // Base directory for cache files (default: %LOCALAPPDATA%/CacheUtility/)
     public string BaseDirectory { get; set; }
-    
-    // Maximum size for individual cache files in bytes (default: 10MB)
+
+    // Maximum size for individual cache files in bytes (default: 10MB; 0 = no limit)
     public long MaxFileSize { get; set; }
+
+    // Optional whitelist of group names that should be persisted.
+    // When null or empty, ALL groups are persisted.
+    public string[] PersistentGroups { get; set; }
 }
 ```
 
-### Utility Methods
+### Utility methods
 
-#### Cache Management
+#### Checking existence
+
+There is no dedicated `Exists` method. Use `TryGet<T>` (preferred, also returns the value) or
+`GetAllByGroup` for bulk checks:
+
 ```csharp
-// Dispose all resources
-void Dispose()
-
-// Check if item exists in cache
-bool Exists(string cacheKey, string groupName)
+// Cheapest "is it cached?" check
+if (Cache.TryGet<MyType>("MyKey", "MyGroup", out _)) { /* present */ }
 ```
 
 ## Performance Benchmarks
 
-Based on internal testing with 1,000 cache operations:
+Numbers below were produced with [BenchmarkDotNet](https://benchmarkdotnet.org/) v0.14.0 on
+.NET 9.0.15 (Windows 11, x64, Concurrent Server GC). The benchmark project lives in
+`CacheUtility.Benchmarks/` — re-run it on your own hardware with:
 
-| Operation | Memory Cache | Persistent Cache (Enabled) | Overhead |
-|-----------|-------------|---------------------------|----------|
-| Cache Hit | ~0.001ms | ~0.001ms | 0% |
-| Cache Miss (Population) | ~1.2ms | ~1.3ms | ~8% |
-| Group Removal | ~0.5ms | ~2.1ms | ~320% |
-| Metadata Retrieval | ~0.8ms | ~1.1ms | ~37% |
+```bash
+dotnet run --project CacheUtility.Benchmarks --configuration Release -- --filter *
+```
 
-**Key Findings**:
-- **Zero overhead** when persistent cache is disabled
-- **Minimal impact** on cache hits (primary use case)
-- **Modest overhead** on cache misses due to serialization
-- **Higher impact** on bulk operations due to file I/O
-- **Memory usage** remains unchanged (files are additional storage)
+All timings are per single API call (not aggregated over many operations).
+
+| Operation                                  | Memory only       | Persistent enabled |
+|--------------------------------------------|------------------:|-------------------:|
+| Cache Hit (one `Get`, item already cached) | **~0.00014 ms**   | **~0.00014 ms**    |
+| Cache Miss (one `Get`, populate callback)  | ~0.04 ms          | ~0.04 ms           |
+| Group Removal (10 items)| **~0.03 ms**      | **~0.51 ms**       |
 
 **Recommendations**:
-- Enable persistent cache for data that benefits from persistence
-- Use fast storage (SSD) for cache directory
-- Monitor file sizes and implement cleanup strategies
-- Consider disabling for high-frequency, temporary data
+- Enable persistent cache for data that genuinely benefits from surviving restarts.
+- For high-frequency, transient data, leave persistent cache off (it's off by default).
 
 ## Memory management
 
@@ -1079,7 +1190,15 @@ The CacheUtility is built on top of .NET's MemoryCache, which has built-in memor
 
 ## Thread safety
 
-All operations in CacheUtility are thread-safe. The implementation uses ReaderWriterLockSlim for efficient concurrent access and CacheLock for synchronizing modifications to the cache.
+All operations in CacheUtility are thread-safe.
+
+- Group membership, dependency tracking, and in-flight populate state are stored in
+  `ConcurrentDictionary` instances.
+- Synchronous populate calls are de-duplicated through `Lazy<object>`; asynchronous populate calls
+  share a single `Task<object>` across all concurrent waiters.
+- A single global `CacheLock` is still used for the small set of operations that must be globally
+  serialized (e.g. enabling/disabling persistent cache, bulk removes, dependency cycle resolution).
+- `RemoveGroup` is cycle-safe: a dependency cycle between groups will not cause infinite recursion.
 
 ## Logging
 
