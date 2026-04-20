@@ -3,7 +3,7 @@
   <PropertyGroup>
     <TargetFramework>net9.0</TargetFramework>
     <GeneratePackageOnBuild>True</GeneratePackageOnBuild>
-    <Version>1.4.1</Version>
+    <Version>1.4.2</Version>
     <Title>Thread-Safe .NET Memory Cache with Groups, Dependencies, Auto-Population &amp; Persistent Storage</Title>
     <Authors>Onno Pistorius</Authors>
     <Company>Athena ICT</Company>
@@ -27,7 +27,9 @@ Perfect for high-performance applications requiring sophisticated caching patter
     <PackageProjectUrl>https://www.athenaict.com/NuGet/Cache</PackageProjectUrl>
     <PackageIcon>Logo_initials.png</PackageIcon>
     <PackageTags>cache;caching;memory-cache;persistent-cache;thread-safe;cache-groups;cache-dependencies;auto-population;performance;dotnet;system-runtime-caching;cache-management;high-performance;scalability;cache-utility;bulk-retrieval;monitoring;metadata;statistics;disk-storage;json-serialization;auto-refresh;cache-monitoring;</PackageTags>
-    <PackageReleaseNotes>v1.4.0: Major perf and correctness release. New: GetAsync, generic GetAllByGroup&lt;T&gt;, TryGet. Perf: ConcurrentDictionary + Lazy&lt;T&gt; populate dedup, reflection eliminated from hot paths, cached size estimation. Bug fixes: RefreshLock now stable, persistent sliding expiration actually slides, RemoveGroup is cycle-safe, group bookkeeping leak on eviction fixed, SetDependencies thread-safe and idempotent. Persistent cache: atomic writes, faster cleanup with pre-filter, orphan file cleanup. 100% backward compatible.</PackageReleaseNotes>
+    <PackageReleaseNotes>v1.4.2: Release notes metadata fix; same code as v1.4.1.
+
+v1.4.1: Critical fix for a deadlock introduced in 1.4.0. Synchronous Cache.Get called with a Task-returning populate (`await Cache.Get(..., async () =&gt; ...)`) could hang under single-threaded SynchronizationContexts (Blazor Server, WPF, WinForms) because the new eager size-estimator walked Task&lt;T&gt;.Result via JsonSerializer. Both RecomputeEstimatedSize and EstimateObjectSize now short-circuit when the value is a Task. Added a one-time Warning diagnostic (deduped per call site) that points sync-over-async callers at Cache.GetAsync. 100% backward compatible; recommended upgrade for all 1.4.0 users.</PackageReleaseNotes>
     <PackageId>CacheUtility</PackageId>
     <Product>CacheUtility</Product>
     <PackageLicenseFile>License.txt</PackageLicenseFile>
