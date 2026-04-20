@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.3] - 2026-04-20
+
+### Added
+- **Eviction-lifecycle logging.** Cache entries now emit diagnostics when they drop out of the cache without being explicitly removed:
+  - `Debug`: `"Cache entry expired: {CacheKey} in group {GroupName}"` when an entry's absolute/sliding TTL fires.
+  - `Information`: `"Cache entry evicted under memory pressure: {CacheKey} in group {GroupName}"` when `MemoryCache` drops an entry under pressure (rare but worth noticing).
+  - Caller-initiated removals (`Cache.Remove`, `Cache.RemoveGroup`, `Cache.RemoveAll`) are still logged at the existing upstream sites and are intentionally suppressed at the eviction hook to avoid duplicate messages.
+
+### Why
+- Persistent-cache consumers (post-1.4.0) could previously see `Save`, `Load`, and the next `Cache miss` but had no visibility into the intervening expiration event. This gap made it impossible to audit whether a group's TTL ever actually fired, or whether background refresh was keeping entries warm indefinitely. With 1.4.3 the full lifecycle `Save → Load → Expired → Miss → Save` is visible at `Debug`.
+
+### Notes
+- Zero new public APIs. Control the volume via your existing `LogLevel` configuration and Serilog filters — setting CacheUtility to `Information` or higher silences the new expiration logs while keeping the louder memory-pressure signal.
+- 100% backward compatible.
+
 ## [1.4.2] - 2026-04-20
 
 ### Changed

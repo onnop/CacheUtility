@@ -946,6 +946,35 @@ namespace CacheUtility
                     subkeys.TryRemove(args.CacheItem.Key, out _);
                 }
 
+                // Diagnostic: surface entry lifecycle events. We only log evictions that weren't
+                // initiated by the caller (Cache.Remove / RemoveGroup already log at Debug). This
+                // lets consumers see when a TTL actually fires vs. when background refresh keeps
+                // an entry warm — critical for auditing persistent-cache effectiveness.
+                if (cacheItem != null && _logger != NullLogger.Instance)
+                {
+                    switch (args.RemovedReason)
+                    {
+                        case CacheEntryRemovedReason.Expired:
+                            if (_logger.IsEnabled(LogLevel.Debug))
+                                _logger.LogDebug(
+                                    "Cache entry expired: {CacheKey} in group {GroupName}",
+                                    cacheItem.CacheKey, cacheItem.GroupName);
+                            break;
+
+                        case CacheEntryRemovedReason.Evicted:
+                            // Memory pressure — rare and worth a louder level.
+                            if (_logger.IsEnabled(LogLevel.Information))
+                                _logger.LogInformation(
+                                    "Cache entry evicted under memory pressure: {CacheKey} in group {GroupName}",
+                                    cacheItem.CacheKey, cacheItem.GroupName);
+                            break;
+
+                        // Removed / ChangeMonitorChanged / CacheSpecificEviction: skipped.
+                        // Caller-initiated removal is already logged upstream; change monitors and
+                        // cache-specific evictions aren't used by this library.
+                    }
+                }
+
                 userCallback?.Invoke(args);
             };
         }
