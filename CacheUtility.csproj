@@ -3,7 +3,7 @@
   <PropertyGroup>
     <TargetFramework>net9.0</TargetFramework>
     <GeneratePackageOnBuild>True</GeneratePackageOnBuild>
-    <Version>1.4.3</Version>
+    <Version>1.4.4</Version>
     <Title>Thread-Safe .NET Memory Cache with Groups, Dependencies, Auto-Population &amp; Persistent Storage</Title>
     <Authors>Onno Pistorius</Authors>
     <Company>Athena ICT</Company>
@@ -27,7 +27,9 @@ Perfect for high-performance applications requiring sophisticated caching patter
     <PackageProjectUrl>https://www.athenaict.com/NuGet/Cache</PackageProjectUrl>
     <PackageIcon>Logo_initials.png</PackageIcon>
     <PackageTags>cache;caching;memory-cache;persistent-cache;thread-safe;cache-groups;cache-dependencies;auto-population;performance;dotnet;system-runtime-caching;cache-management;high-performance;scalability;cache-utility;bulk-retrieval;monitoring;metadata;statistics;disk-storage;json-serialization;auto-refresh;cache-monitoring;</PackageTags>
-    <PackageReleaseNotes>v1.4.3: Eviction-lifecycle logging. Cache entries now emit a Debug log when they expire naturally ("Cache entry expired: {CacheKey} in group {GroupName}") and an Information log when evicted under memory pressure ("Cache entry evicted under memory pressure: ..."). Caller-initiated removals (Cache.Remove / RemoveGroup) are still logged upstream and intentionally suppressed at the eviction hook to avoid duplicate messages. This closes the lifecycle-visibility gap for persistent-cache consumers who need to audit whether their TTLs actually trigger. 100% backward compatible; opt-in via your existing LogLevel configuration (no new APIs).
+    <PackageReleaseNotes>v1.4.4: Fix for an async single-flight race in `Cache.GetAsync`. The in-flight dictionary previously stored bare `Task&lt;object&gt;` values and relied on `ConcurrentDictionary.GetOrAdd` to dedup concurrent populates. `GetOrAdd`'s factory may be invoked multiple times under contention (documented behavior), so the populate delegate could run more than once when several threads raced into a cold key — even though only one resulting Task was ultimately retained. Wrapping the in-flight value in `Lazy&lt;Task&lt;object&gt;&gt;` with `LazyThreadSafetyMode.ExecutionAndPublication` ensures the populate delegate runs exactly once across all racing callers. A new true-parallel unit test (`GetAsync_TrueConcurrent_PopulatesExactlyOnce`) reproduces the previous race deterministically. Sync path was already race-safe via `Lazy&lt;object&gt;` and is unchanged. 100% backward compatible.
+
+v1.4.3: Eviction-lifecycle logging. Cache entries now emit a Debug log when they expire naturally ("Cache entry expired: {CacheKey} in group {GroupName}") and an Information log when evicted under memory pressure ("Cache entry evicted under memory pressure: ..."). Caller-initiated removals (Cache.Remove / RemoveGroup) are still logged upstream and intentionally suppressed at the eviction hook to avoid duplicate messages. This closes the lifecycle-visibility gap for persistent-cache consumers who need to audit whether their TTLs actually trigger. 100% backward compatible; opt-in via your existing LogLevel configuration (no new APIs).
 
 v1.4.2: Release notes metadata fix; same code as v1.4.1.
 

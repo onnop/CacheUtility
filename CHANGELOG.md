@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.4] - 2026-05-16
+
+### Fixed
+- **Async single-flight race in `Cache.GetAsync`.** The in-flight dictionary previously stored bare `Task<object>` values and relied on `ConcurrentDictionary.GetOrAdd` to dedup concurrent populates. `GetOrAdd`'s factory may be invoked multiple times under contention — this is documented behavior, with the docs warning that *"valueFactory may be called multiple times"*. When several threads raced into a cold key simultaneously, the user's `populateMethod` could therefore run more than once, even though only one resulting `Task` was ultimately retained in the dictionary.
+- The fix wraps the in-flight value in `Lazy<Task<object>>` with `LazyThreadSafetyMode.ExecutionAndPublication`, mirroring the pattern already used by the sync path's `_inflightSync`. The `Lazy` guarantees the factory runs exactly once even when multiple threads call `GetOrAdd` simultaneously.
+
+### Added
+- `NewApiTests.GetAsync_TrueConcurrent_PopulatesExactlyOnce`: a true-parallel test using `Task.Run` + `ManualResetEventSlim` gate to release N threads simultaneously into `GetAsync`. Reproduces the pre-1.4.4 race deterministically when run against the bare-`Task<object>` implementation; passes after the `Lazy` wrap. The existing `GetAsync_ConcurrentSameKey_PopulatesExactlyOnce` test was retained but it executes its 16 calls sequentially on the caller's thread, so it never actually contends on `GetOrAdd` and could not catch this bug.
+
+### Notes
+- Sync path (`Cache.Get`) was already race-safe via `_inflightSync` storing `Lazy<object>` and is unchanged.
+- 100% backward compatible.
+
 ## [1.4.3] - 2026-04-20
 
 ### Added

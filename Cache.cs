@@ -75,9 +75,16 @@ namespace CacheUtility
 
         /// <summary>
         /// In-flight asynchronous populate operations keyed by full cache key.
+        /// <para>
+        /// Wrapped in <see cref="Lazy{T}"/> with <see cref="LazyThreadSafetyMode.ExecutionAndPublication"/>
+        /// so that even when <see cref="ConcurrentDictionary{TKey,TValue}.GetOrAdd(TKey,System.Func{TKey,TValue})"/>'s
+        /// factory races under contention (documented behavior — the factory may be invoked multiple times),
+        /// only ONE Task is ever materialized. Without this, the populate method could fire 2–3× on cold
+        /// start when multiple threads race to populate the same key — observed downstream as duplicate API calls.
+        /// </para>
         /// </summary>
-        private static readonly ConcurrentDictionary<string, Task<object>> _inflightAsync =
-            new ConcurrentDictionary<string, Task<object>>(StringComparer.Ordinal);
+        private static readonly ConcurrentDictionary<string, Lazy<Task<object>>> _inflightAsync =
+            new ConcurrentDictionary<string, Lazy<Task<object>>>(StringComparer.Ordinal);
 
         /// <summary>
         /// Deduplicates the "sync Get received a Task-returning populate" warning so each populate
@@ -805,25 +812,32 @@ namespace CacheUtility
 
         /// <summary>
         /// Asynchronous populate path with single-flight de-duplication via in-flight Task.
+        /// <para>
+        /// The factory is wrapped in <see cref="Lazy{T}"/> because <see cref="ConcurrentDictionary{TKey,TValue}.GetOrAdd(TKey,System.Func{TKey,TValue})"/>
+        /// may invoke its factory multiple times under concurrent contention. Wrapping in
+        /// <see cref="LazyThreadSafetyMode.ExecutionAndPublication"/> ensures the populate
+        /// method (and the resulting Task) is materialized exactly once across all racing callers.
+        /// </para>
         /// </summary>
         private static Task<CacheItem<TData>> LoadCacheItemAsync<TData>(string fullKey, string cacheKey, string groupName, DateTime absoluteExpiration, TimeSpan slidingExpiration, CacheItemPriority priority, Func<Task<TData>> populateMethod, CacheEntryRemovedCallback removedCallback, TimeSpan refresh, CancellationToken cancellationToken)
         {
-            var task = _inflightAsync.GetOrAdd(fullKey, _ =>
-                CreateAndStoreCacheItemAsync(fullKey, cacheKey, groupName, absoluteExpiration, slidingExpiration, priority, populateMethod, removedCallback, refresh)
-            );
+            var lazy = _inflightAsync.GetOrAdd(fullKey, _ =>
+                new Lazy<Task<object>>(
+                    () => CreateAndStoreCacheItemAsync(fullKey, cacheKey, groupName, absoluteExpiration, slidingExpiration, priority, populateMethod, removedCallback, refresh),
+                    LazyThreadSafetyMode.ExecutionAndPublication));
 
-            return AwaitAsync(task, fullKey, cancellationToken);
+            return AwaitAsync(lazy, fullKey, cancellationToken);
 
-            static async Task<CacheItem<TData>> AwaitAsync(Task<object> shared, string key, CancellationToken ct)
+            static async Task<CacheItem<TData>> AwaitAsync(Lazy<Task<object>> shared, string key, CancellationToken ct)
             {
                 try
                 {
-                    var item = await shared.WaitAsync(ct).ConfigureAwait(false);
+                    var item = await shared.Value.WaitAsync(ct).ConfigureAwait(false);
                     return (CacheItem<TData>)item;
                 }
                 finally
                 {
-                    _inflightAsync.TryRemove(new KeyValuePair<string, Task<object>>(key, shared));
+                    _inflightAsync.TryRemove(new KeyValuePair<string, Lazy<Task<object>>>(key, shared));
                 }
             }
         }

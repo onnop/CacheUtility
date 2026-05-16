@@ -66,6 +66,56 @@ namespace CacheUtility.Tests
             Assert.Equal(1, calls);
         }
 
+        /// <summary>
+        /// True-parallel single-flight: many threads enter <see cref="Cache.GetAsync"/>
+        /// for the same cold key simultaneously via <see cref="Task.Run"/> + a release gate.
+        /// <para>
+        /// This exercises a different code path than <see cref="GetAsync_ConcurrentSameKey_PopulatesExactlyOnce"/>:
+        /// that test issues 16 calls sequentially on the caller's thread (the for-loop runs in
+        /// order, so by the time call #2 enters <c>LoadCacheItemAsync</c>, call #1 has already
+        /// installed the in-flight entry — no real race on <see cref="ConcurrentDictionary{TKey,TValue}.GetOrAdd"/>).
+        /// </para>
+        /// <para>
+        /// Without the <see cref="Lazy{T}"/> wrapper around <c>_inflightAsync</c>, this test
+        /// is reproducibly flaky: 2–3 threads can all observe a missing entry and all run the
+        /// <c>GetOrAdd</c> factory (documented behavior — the factory can be invoked multiple
+        /// times under contention). Only one task is ultimately stored, but the populate
+        /// method has already fired multiple times → duplicate downstream API calls.
+        /// </para>
+        /// </summary>
+        [Fact]
+        public async Task GetAsync_TrueConcurrent_PopulatesExactlyOnce()
+        {
+            const string group = "asyncDedup_TrueParallel";
+            const string key = "k";
+            const int parallelism = 32;
+            int calls = 0;
+
+            using var gate = new ManualResetEventSlim(false);
+            var tasks = new Task<string>[parallelism];
+
+            for (int i = 0; i < parallelism; i++)
+            {
+                tasks[i] = Task.Run(async () =>
+                {
+                    gate.Wait();
+                    return await Cache.GetAsync(key, group, async () =>
+                    {
+                        Interlocked.Increment(ref calls);
+                        await Task.Delay(50);
+                        return "value";
+                    });
+                });
+            }
+
+            await Task.Delay(50);
+            gate.Set();
+            await Task.WhenAll(tasks);
+
+            Assert.All(tasks, t => Assert.Equal("value", t.Result));
+            Assert.Equal(1, calls);
+        }
+
         [Fact]
         public async Task GetAsync_HitsMemoryCacheWithoutInvokingPopulate()
         {
