@@ -852,6 +852,9 @@ namespace CacheUtility
             var fromPersistent = LoadFromPersistentCache<TData>(fullKey, cacheKey, groupName, absoluteExpiration, slidingExpiration);
             if (fromPersistent != null)
             {
+                // Reattach the async populate delegate so background refresh can re-invoke it later.
+                // Without this, persistent-restored async entries silently lose their refresh capability.
+                fromPersistent.PopulateMethodCacheAsync = populateMethod;
                 fromPersistent.RefreshInterval = refresh;
                 AddToMemoryCache(fullKey, fromPersistent, absoluteExpiration, slidingExpiration, priority, removedCallback, refresh);
                 return fromPersistent;
@@ -868,6 +871,10 @@ namespace CacheUtility
                 Item = value,
                 LastRefreshTime = DateTime.Now,
                 RefreshInterval = refresh,
+                // Store the async populate delegate so SetupRefreshTimer / StartBackgroundRefresh
+                // can re-invoke it. The sync path stores PopulateMethodCache; the async path needs
+                // its own slot because the delegate signatures differ (Func<T> vs Func<Task<T>>).
+                PopulateMethodCacheAsync = populateMethod,
                 CacheKey = cacheKey,
                 GroupName = groupName,
                 IsRefreshing = false,
@@ -885,10 +892,19 @@ namespace CacheUtility
 
         /// <summary>
         /// Starts a background refresh operation for a cache item.
+        /// <para>
+        /// Handles both sync (<see cref="CacheItem{T}.PopulateMethodCache"/>) and async
+        /// (<see cref="CacheItem{T}.PopulateMethodCacheAsync"/>) populates. Entries created
+        /// via <see cref="GetAsync{TData}(string, string, TimeSpan, Func{Task{TData}}, TimeSpan, CancellationToken)"/>
+        /// only have the async slot populated and would silently never refresh otherwise.
+        /// </para>
         /// </summary>
         private static void StartBackgroundRefresh<TData>(CacheItem<TData> cacheItem, string fullCacheKey)
         {
-            if (cacheItem?.PopulateMethodCache == null) return;
+            if (cacheItem == null) return;
+            var syncPopulate = cacheItem.PopulateMethodCache;
+            var asyncPopulate = cacheItem.PopulateMethodCacheAsync;
+            if (syncPopulate == null && asyncPopulate == null) return;
 
             lock (cacheItem.RefreshLock)
             {
@@ -906,15 +922,26 @@ namespace CacheUtility
             if (_logger.IsEnabled(LogLevel.Debug))
                 _logger.LogDebug("Starting background refresh for {CacheKey} in group {GroupName}", cacheItem.CacheKey, cacheItem.GroupName);
 
-            cacheItem.RefreshTask = Task.Run(() =>
+            cacheItem.RefreshTask = Task.Run(async () =>
             {
                 try
                 {
                     var currentItem = MemoryCache.Default.Get(fullCacheKey) as CacheItem<TData>;
                     if (currentItem == null || currentItem != cacheItem) return;
 
-                    var newValue = cacheItem.PopulateMethodCache.Invoke();
-                    WarnOnTaskReturningSyncPopulate(newValue, cacheItem.PopulateMethodCache, cacheItem.CacheKey, cacheItem.GroupName);
+                    TData newValue;
+                    if (asyncPopulate != null)
+                    {
+                        // Async populates are awaited inside the background Task so we never block
+                        // the calling thread and never invoke sync-over-async on a Func<Task<T>>.
+                        newValue = await asyncPopulate().ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        newValue = syncPopulate.Invoke();
+                        WarnOnTaskReturningSyncPopulate(newValue, syncPopulate, cacheItem.CacheKey, cacheItem.GroupName);
+                    }
+
                     UpdateCacheItemValue(cacheItem, newValue);
 
                     if (_logger.IsEnabled(LogLevel.Debug))
@@ -995,7 +1022,10 @@ namespace CacheUtility
 
         private static void SetupRefreshTimer<T>(CacheItem<T> cacheItem, string fullCacheKey)
         {
-            if (cacheItem.RefreshInterval <= TimeSpan.Zero || cacheItem.PopulateMethodCache == null) return;
+            if (cacheItem.RefreshInterval <= TimeSpan.Zero) return;
+            // Either populate slot is sufficient — sync entries fill PopulateMethodCache,
+            // async entries (GetAsync) fill PopulateMethodCacheAsync.
+            if (cacheItem.PopulateMethodCache == null && cacheItem.PopulateMethodCacheAsync == null) return;
 
             cacheItem.RefreshTimer?.Dispose();
             cacheItem.RefreshTimer = new Timer(
@@ -1008,7 +1038,8 @@ namespace CacheUtility
 
         private static void RefreshCacheItem<T>(string fullCacheKey, CacheItem<T> cacheItem)
         {
-            if (cacheItem?.PopulateMethodCache == null) return;
+            if (cacheItem == null) return;
+            if (cacheItem.PopulateMethodCache == null && cacheItem.PopulateMethodCacheAsync == null) return;
 
             try
             {
@@ -1631,6 +1662,16 @@ namespace CacheUtility
             [NonSerialized]
             private Func<T> _populateMethod;
 
+            /// <summary>
+            /// Async populate delegate captured when this item was created via
+            /// <see cref="Cache.GetAsync{TData}(string, string, TimeSpan, Func{Task{TData}}, TimeSpan, CancellationToken)"/>.
+            /// Stored separately from <see cref="_populateMethod"/> because the signatures differ
+            /// (<c>Func&lt;T&gt;</c> vs <c>Func&lt;Task&lt;T&gt;&gt;</c>). Required so background refresh
+            /// can re-invoke the original async producer without sync-over-async.
+            /// </summary>
+            [NonSerialized]
+            private Func<Task<T>> _populateMethodAsync;
+
             [NonSerialized]
             private Timer _refreshTimer;
 
@@ -1715,6 +1756,16 @@ namespace CacheUtility
             }
 
             /// <summary>
+            /// Internal alias used by the cache infrastructure to read/write the async populate
+            /// method captured at <see cref="Cache.GetAsync{TData}(string, string, TimeSpan, Func{Task{TData}}, TimeSpan, CancellationToken)"/> time.
+            /// </summary>
+            internal Func<Task<T>> PopulateMethodCacheAsync
+            {
+                get => _populateMethodAsync;
+                set => _populateMethodAsync = value;
+            }
+
+            /// <summary>
             /// Timer for automatic refresh.
             /// </summary>
             public Timer RefreshTimer
@@ -1773,7 +1824,7 @@ namespace CacheUtility
             // ===== ICacheItem (internal type-erased view) =====
 
             object ICacheItem.ItemBoxed => Item;
-            string ICacheItem.PopulateMethodName => Cache.GetMethodName(_populateMethod);
+            string ICacheItem.PopulateMethodName => Cache.GetMethodName((Delegate)_populateMethod ?? _populateMethodAsync);
             long? ICacheItem.CachedEstimatedSize => _cachedEstimatedSize;
             Type ICacheItem.DataType => typeof(T);
 

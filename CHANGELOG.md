@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.5] - 2026-05-16
+
+### Fixed
+- **Background auto-refresh was a no-op for entries created via `Cache.GetAsync`.** Since the `GetAsync` family shipped in 1.4.0, passing a `refresh` interval had no effect on async entries: the populate delegate was never stored on the `CacheItem<T>`, so both the periodic timer and the on-access refresh probe early-returned and the populate method was never re-invoked. Entries stayed at their initial value until they expired, defeating the documented "non-blocking background refresh" pattern for the entire async API surface. Sync entries (`Cache.Get`) were unaffected.
+- The fix adds a separate `PopulateMethodCacheAsync` slot on `CacheItem<T>` (the existing `PopulateMethodCache` slot can't be reused because the delegate signatures differ — `Func<T>` vs `Func<Task<T>>`). `CreateAndStoreCacheItemAsync` now stores the async delegate on both the fresh-populate and persistent-restore paths, `SetupRefreshTimer` arms the timer when either populate slot is set, and `StartBackgroundRefresh` awaits the async populate inside its `Task.Run` so we never sync-over-async.
+
+### Added
+- `NewApiTests.GetAsync_WithAutoRefresh_RefreshesInBackgroundOnAccess`: covers the fast-path refresh probe — populate is re-invoked after a subsequent `GetAsync` call that follows the refresh interval.
+- `NewApiTests.GetAsync_WithAutoRefresh_TimerRefreshesWithoutAccess`: covers the periodic timer — populate is re-invoked on a schedule without any further `GetAsync` access. Both tests reproduce the pre-1.4.5 bug deterministically (populate stays at `calls == 1`) and pass after the fix.
+
+### Notes
+- The `NormalizeRefresh` anti-thrash guard still silently clamps `refresh < 1 second` to zero. Callers expecting sub-second refresh should consider that intentional behavior rather than a bug.
+- 100% backward compatible. No public API surface changes.
+
 ## [1.4.4] - 2026-05-16
 
 ### Fixed

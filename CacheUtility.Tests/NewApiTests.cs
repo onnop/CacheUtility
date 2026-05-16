@@ -197,6 +197,105 @@ namespace CacheUtility.Tests
         }
 
         // -----------------------------------------------------------------
+        // GetAsync + background refresh
+        //
+        // Regression guard for a bug where async cache entries (created via GetAsync)
+        // were never background-refreshed because:
+        //   1) CreateAndStoreCacheItemAsync never stored the async populate delegate
+        //      on the CacheItem<T> (the sync path did),
+        //   2) StartBackgroundRefresh / SetupRefreshTimer both early-return when the
+        //      stored populate is null,
+        //   3) so the refresh timer was never armed and the on-access refresh probe
+        //      always short-circuited.
+        //
+        // Net effect: entries created by GetAsync stayed at their initial value until
+        // they expired, even when the caller explicitly passed a refresh interval.
+        // -----------------------------------------------------------------
+
+        [Fact]
+        public async Task GetAsync_WithAutoRefresh_RefreshesInBackgroundOnAccess()
+        {
+            const string group = "asyncRefreshOnAccess";
+            const string key = "k";
+            // Refresh < 1s is silently disabled by NormalizeRefresh (anti-thrash guard),
+            // so we use 1s here.
+            var refresh = TimeSpan.FromSeconds(1);
+            int calls = 0;
+
+            Task<string> Populate() => Task.FromResult($"v{Interlocked.Increment(ref calls)}");
+
+            // First call populates with a long TTL and a 1s refresh interval.
+            var v1 = await Cache.GetAsync(key, group, TimeSpan.FromMinutes(10), Populate, refresh: refresh);
+            Assert.Equal("v1", v1);
+            Assert.Equal(1, calls);
+
+            // Metadata should reflect the refresh interval — for an entry created via
+            // GetAsync this was the bug: the refresh interval was effectively ignored
+            // because no populate delegate was stored, so the timer never armed.
+            var meta = Cache.GetAllCacheMetadata().FirstOrDefault(m => m.CacheKey == key && m.GroupName == group);
+            Assert.NotNull(meta);
+            Assert.Equal(refresh, meta!.RefreshInterval);
+            Assert.NotNull(meta.NextRefreshTime);
+
+            // Wait past the refresh interval, then access again. By this point the
+            // background timer may have already fired once (with refresh=1s the first
+            // effective refresh lands at t≈1s) — that's fine; we just need to confirm
+            // the populate ran more than once.
+            await Task.Delay(refresh + TimeSpan.FromMilliseconds(250));
+            var v2 = await Cache.GetAsync(key, group, TimeSpan.FromMinutes(10), Populate, refresh: refresh);
+            // v2 is either "v1" (timer hadn't fired yet) or "v2" (timer-driven refresh
+            // already published); either way it must be a "v<n>"-shaped value.
+            Assert.StartsWith("v", v2);
+
+            // Give the background refresh a moment to complete and publish the new value.
+            for (int i = 0; i < 30 && calls < 2; i++)
+            {
+                await Task.Delay(50);
+            }
+
+            Assert.True(calls >= 2, $"Background refresh should have invoked populate again; calls={calls}");
+
+            // A subsequent access should now observe the refreshed value.
+            var v3 = await Cache.GetAsync(key, group, TimeSpan.FromMinutes(10), Populate, refresh: refresh);
+            Assert.Equal($"v{calls}", v3);
+        }
+
+        [Fact]
+        public async Task GetAsync_WithAutoRefresh_TimerRefreshesWithoutAccess()
+        {
+            const string group = "asyncRefreshTimer";
+            const string key = "k";
+            // Minimum refresh interval that survives NormalizeRefresh's < 1s anti-thrash guard.
+            var refresh = TimeSpan.FromSeconds(1);
+            int calls = 0;
+
+            Task<string> Populate() => Task.FromResult($"v{Interlocked.Increment(ref calls)}");
+
+            // Populate once with a 1s refresh interval, then do NOT touch the entry again.
+            // The internal refresh timer should fire periodically and re-invoke the populate
+            // method on its own — without any further GetAsync access.
+            var v1 = await Cache.GetAsync(key, group, TimeSpan.FromMinutes(10), Populate, refresh: refresh);
+            Assert.Equal("v1", v1);
+            Assert.Equal(1, calls);
+
+            // Poll for up to ~3s; success as soon as the timer fires at least once.
+            for (int i = 0; i < 30 && calls < 2; i++)
+            {
+                await Task.Delay(100);
+            }
+
+            Assert.True(calls >= 2, $"Refresh timer should have fired at least once without an explicit Get; calls={calls}");
+
+            // Allow the in-flight refresh task (if any) to publish, then verify the cached
+            // value reflects the refreshed data. TryGet avoids populate side-effects.
+            await Task.Delay(150);
+            Assert.True(Cache.TryGet<string>(key, group, out var cached));
+            Assert.StartsWith("v", cached);
+            int cachedCallNum = int.Parse(cached!.Substring(1));
+            Assert.True(cachedCallNum >= 2, $"Cached value should reflect a refreshed populate (>= v2); was {cached}");
+        }
+
+        // -----------------------------------------------------------------
         // Generic GetAllByGroup<T>
         // -----------------------------------------------------------------
 
