@@ -51,13 +51,6 @@ using CacheUtility;
 // Simple caching with automatic population
 var userData = Cache.Get("user_123", "users", () => GetUserFromDatabase(123));
 
-// Enable persistent cache for specific groups
-var options = new PersistentCacheOptions
-{
-    PersistentGroups = new[] { "users", "settings" }
-};
-Cache.EnablePersistentCache(options);
-
 // Cache with auto-refresh every 5 minutes
 var config = Cache.Get("app_config", "settings", 
     TimeSpan.FromHours(1), 
