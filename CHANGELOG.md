@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.6] - 2026-08-26
+
+### Fixed
+- **Group-bookkeeping race that permanently orphaned cache entries.** `RemoveGroup` removed the whole group from the internal group map (`TryRemove`) and then swept a snapshot of that group's keys, while `AddToMemoryCache` registered its key in the group *before* writing the value to `MemoryCache`. When a populate straddled a concurrent `RemoveGroup`, the add's key was registered in a group object the remover had already detached, and its value reached `MemoryCache` after the sweep had passed. The entry was then live in `MemoryCache` but unreachable from the group map: **no later `RemoveGroup` could ever evict it**, and it kept serving the pre-invalidation value until its own TTL expired.
+- This is not a corner case in multi-user applications. Any service that invalidates a group on every write, while other requests concurrently populate the same group, is exposed on every overlap. A 4-thread invalidation load orphaned **1,421 of 4,000** entries (~35%); with the invalidation threads removed, zero. Long TTLs make it worse: a 10-minute entry orphaned this way serves stale data for the full ten minutes with no way to flush it.
+
+### How it is fixed
+- Group membership now lives in a `CacheGroup` holder that carries the key set plus a **sweep generation** counter, and `RemoveGroup` never detaches that holder — it bumps the generation and drains the group **in place**. Because the holder is never swapped out, a concurrent add can no longer end up writing into a dictionary nobody can reach.
+- `AddToMemoryCache` samples the group's generation, publishes the value to `MemoryCache` **first**, then registers the key. If the generation moved (or `RemoveAll` / `RemoveAllButThese` swapped the holder) it rolls its own entry back and returns `false`. A group invalidation that is concurrent with a populate now always wins, instead of leaving behind an entry the invalidation was supposed to have removed. The persistent-cache write is skipped for a rolled-back entry, so the discarded value is not resurrected from disk on the next miss.
+- `RemoveByInternalKey` now removes the value from `MemoryCache` **before** dropping the group registration. The old order deregistered first, which let a concurrent `RemoveGroup` snapshot skip a key whose value was still live and readable, and return claiming the group was empty.
+- The entry-removal callback only deregisters a key when it is not occupied by a replacement entry, and re-registers one that appears underneath it. `MemoryCache` also fires that callback from its own background flush of expired items, which can land after the key has been repopulated; deregistering unconditionally would strip the replacement's group membership. This one is defensive — every path through the public API probes `MemoryCache` before adding, which flushes an expired predecessor on the calling thread first.
+
+### Added
+- `GroupRemovalRaceTests.RemoveGroup_ConcurrentWithPopulate_NeverOrphansEntries`: 4,000 cycles of populate → `RemoveGroup` → re-read, with four background threads hammering `RemoveGroup` on the same group. Each cycle asserts the populate ran again, i.e. that a `RemoveGroup` starting *after* the populate completed actually evicted the entry. Reproduces the bug deterministically (1,421 orphans pre-fix, 0 post-fix) and additionally asserts that at least one add really did overlap a removal, so the test cannot pass vacuously if the window never opens.
+- `GroupRemovalRaceTests.RemoveGroup_TrueConcurrentWithSyncPopulate_LeavesNoUnreachableEntries`: 1,000 rounds releasing eight synchronous populates and one `RemoveGroup` simultaneously through a gate, then asserting that a subsequent quiescent `RemoveGroup` clears everything the racing one left behind.
+- Internal test hooks (`DiscardedAddCount`, `InspectForTesting`) used by those assertions to distinguish "value gone but registration stale" from "registration gone but value live" when a failure is reported.
+
+### Notes
+- 100% backward compatible. No public API surface changes.
+- Behavioural change worth knowing: a populate whose group is invalidated while it is running no longer caches its result. The caller still receives the value it computed; it is simply not retained, because the invalidation that overlapped it wins. Under a continuous stream of `RemoveGroup` calls on a group, entries in that group will therefore not stick — which is the correct reading of the caller's own invalidation.
+- `RemoveGroup` now leaves an empty group holder behind (a few dozen bytes per distinct group name) rather than removing the map entry. Group names are a bounded, application-defined set; `RemoveAll` and `RemoveAllButThese` still reclaim the holders.
+
 ## [1.4.5] - 2026-05-16
 
 ### Fixed

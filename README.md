@@ -40,7 +40,7 @@ dotnet add package CacheUtility
 
 ### PackageReference
 ```xml
-<PackageReference Include="CacheUtility" Version="1.4.3" />
+<PackageReference Include="CacheUtility" Version="1.4.6" />
 ```
 
 ## Quick Start

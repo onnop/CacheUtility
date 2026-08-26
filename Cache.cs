@@ -61,10 +61,76 @@ namespace CacheUtility
             new ConcurrentDictionary<string, string[]>(StringComparer.Ordinal);
 
         /// <summary>
-        /// Group name -> set of full cache keys that belong to it (value byte is unused; this is a concurrent set).
+        /// Bookkeeping for a single cache group: the set of full cache keys that belong to it, plus a
+        /// sweep generation counter.
+        /// <para>
+        /// The generation is incremented at the start of every group-wide removal. An add that observes
+        /// a changed generation after publishing its value knows a removal ran across it and rolls its
+        /// own entry back. Without that handshake, an entry whose populate straddled a
+        /// <see cref="RemoveGroup"/> could reach <c>MemoryCache</c> after the sweep had already passed
+        /// its key, and would then serve stale reads until its own TTL expired.
+        /// </para>
         /// </summary>
-        private static readonly ConcurrentDictionary<string, ConcurrentDictionary<string, byte>> _groups =
-            new ConcurrentDictionary<string, ConcurrentDictionary<string, byte>>(StringComparer.Ordinal);
+        private sealed class CacheGroup
+        {
+            /// <summary>Full cache keys in this group (the byte value is unused; this is a concurrent set).</summary>
+            internal readonly ConcurrentDictionary<string, byte> Keys =
+                new ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
+
+            private int _generation;
+
+            /// <summary>Number of group-wide removals that have begun on this group.</summary>
+            internal int Generation => Volatile.Read(ref _generation);
+
+            /// <summary>
+            /// Announces that a group-wide removal is starting. Must be called before snapshotting
+            /// <see cref="Keys"/> so that any add still in flight is guaranteed to see the change.
+            /// </summary>
+            internal void BeginSweep() => Interlocked.Increment(ref _generation);
+        }
+
+        /// <summary>
+        /// Group name -> that group's bookkeeping.
+        /// <para>
+        /// <see cref="RemoveGroup"/> deliberately never detaches a <see cref="CacheGroup"/> from this
+        /// dictionary; it drains the group in place. A detached group would still be referenced by any
+        /// concurrent add that had already resolved it, so keys registered there afterwards would be
+        /// unreachable from <c>_groups</c> forever — entries that no later <c>RemoveGroup</c> could
+        /// evict. The empty holder left behind is a few dozen bytes per distinct group name; the bulk
+        /// reset operations (<see cref="RemoveAll"/>, <see cref="RemoveAllButThese"/>) reclaim it, and
+        /// adds detect that detachment via the same generation handshake.
+        /// </para>
+        /// </summary>
+        private static readonly ConcurrentDictionary<string, CacheGroup> _groups =
+            new ConcurrentDictionary<string, CacheGroup>(StringComparer.Ordinal);
+
+        /// <summary>
+        /// Number of cache entries rolled back because a group-wide removal overlapped their add.
+        /// Exposed to tests so the race regression suite can prove it actually opened the window
+        /// rather than passing vacuously.
+        /// </summary>
+        private static long _discardedAdds;
+
+        /// <summary>Test hook: total adds discarded by a concurrent group invalidation.</summary>
+        internal static long DiscardedAddCount => Interlocked.Read(ref _discardedAdds);
+
+        /// <summary>Test hook: resets <see cref="DiscardedAddCount"/>.</summary>
+        internal static void ResetDiscardedAddCountForTesting() => Interlocked.Exchange(ref _discardedAdds, 0);
+
+        /// <summary>
+        /// Test hook: one-line dump of an entry's bookkeeping state (present in <c>MemoryCache</c>,
+        /// registered in its group, group holder present, persistent cache on, sweep generation).
+        /// Used in the race-regression assertion messages, where knowing which half of the
+        /// value/registration pair is missing is what distinguishes the failure modes.
+        /// </summary>
+        internal static string InspectForTesting(string groupName, string cacheKey)
+        {
+            var fullKey = BuildFullKey(groupName, cacheKey);
+            var inMemory = MemoryCache.Default.Get(fullKey) != null;
+            var groupPresent = _groups.TryGetValue(groupName, out var g);
+            var registered = groupPresent && g.Keys.ContainsKey(fullKey);
+            return $"mem={inMemory} reg={registered} grp={groupPresent} persist={_persistentOptions != null} gen={(groupPresent ? g.Generation : -1)}";
+        }
 
         /// <summary>
         /// In-flight synchronous populate operations keyed by full cache key.
@@ -298,11 +364,11 @@ namespace CacheUtility
             if (cacheKeys == null) throw new ArgumentNullException(nameof(cacheKeys));
             if (string.IsNullOrEmpty(groupName)) throw new ArgumentNullException(nameof(groupName));
 
-            if (!_groups.TryGetValue(groupName, out var subkeys)) return;
+            if (!_groups.TryGetValue(groupName, out var group)) return;
 
             var prefix = groupName + "_";
             var matched = new List<string>();
-            foreach (var fullKey in subkeys.Keys)
+            foreach (var fullKey in group.Keys.Keys)
             {
                 var originalKey = fullKey.StartsWith(prefix, StringComparison.Ordinal)
                     ? fullKey.Substring(prefix.Length)
@@ -338,7 +404,9 @@ namespace CacheUtility
             var allKeys = new List<(string fullKey, string group)>();
             foreach (var kvp in _groups)
             {
-                foreach (var key in kvp.Value.Keys)
+                // Bump first so an add still in flight rolls itself back instead of surviving the reset.
+                kvp.Value.BeginSweep();
+                foreach (var key in kvp.Value.Keys.Keys)
                 {
                     allKeys.Add((key, kvp.Key));
                 }
@@ -349,10 +417,11 @@ namespace CacheUtility
                 RemoveByInternalKey(allKeys[i].fullKey, knownGroup: allKeys[i].group);
             }
 
-            // Clear any empty group entries that may remain.
+            // Reclaim empty group holders. Detaching one is safe here only because every add
+            // re-checks that its group is still the instance registered in _groups.
             foreach (var kvp in _groups)
             {
-                if (kvp.Value.IsEmpty)
+                if (kvp.Value.Keys.IsEmpty)
                     _groups.TryRemove(kvp.Key, out _);
             }
         }
@@ -366,7 +435,8 @@ namespace CacheUtility
             var allKeys = new List<(string fullKey, string group)>();
             foreach (var kvp in _groups)
             {
-                foreach (var key in kvp.Value.Keys)
+                kvp.Value.BeginSweep();
+                foreach (var key in kvp.Value.Keys.Keys)
                 {
                     allKeys.Add((key, kvp.Key));
                 }
@@ -398,7 +468,10 @@ namespace CacheUtility
             {
                 if (excluded.Contains(kvp.Key)) continue;
 
-                var fullKeys = kvp.Value.Keys.ToArray();
+                // Bump before snapshotting so a concurrent add rolls itself back rather than
+                // registering into the holder we are about to detach.
+                kvp.Value.BeginSweep();
+                var fullKeys = kvp.Value.Keys.Keys.ToArray();
                 for (int i = 0; i < fullKeys.Length; i++)
                 {
                     RemoveByInternalKey(fullKeys[i], knownGroup: kvp.Key);
@@ -427,17 +500,25 @@ namespace CacheUtility
             if (groupName == null) return;
             if (!visited.Add(groupName)) return;
 
-            if (!_groups.TryRemove(groupName, out var subkeys))
+            if (!_groups.TryGetValue(groupName, out var group))
             {
                 if (_logger.IsEnabled(LogLevel.Debug))
                     _logger.LogDebug("RemoveGroup: group {GroupName} not found, skipping", groupName);
             }
             else
             {
-                if (_logger.IsEnabled(LogLevel.Debug))
-                    _logger.LogDebug("Removing cache group {GroupName} ({KeyCount} keys)", groupName, subkeys.Count);
+                // Announce the sweep before reading the key snapshot. Any add that has already
+                // published its value but not yet finished registering will compare generations,
+                // see this bump, and remove its own entry, which is what makes the removal
+                // complete even for populates that straddle this call.
+                group.BeginSweep();
 
-                foreach (var fullKey in subkeys.Keys)
+                if (_logger.IsEnabled(LogLevel.Debug))
+                    _logger.LogDebug("Removing cache group {GroupName} ({KeyCount} keys)", groupName, group.Keys.Count);
+
+                // Drain in place. The holder itself stays registered in _groups so that no
+                // concurrent add can end up writing into a dictionary nobody can reach.
+                foreach (var fullKey in group.Keys.Keys)
                 {
                     RemoveByInternalKey(fullKey, knownGroup: groupName);
                 }
@@ -748,8 +829,12 @@ namespace CacheUtility
             };
             item.RecomputeEstimatedSize();
 
-            AddToMemoryCache(fullKey, item, absoluteExpiration, slidingExpiration, priority, removedCallback, refresh);
-            SaveToPersistentCache(fullKey, item, absoluteExpiration, slidingExpiration);
+            // Skip the persistent write when the entry was rolled back, otherwise the value the
+            // invalidation just discarded would be resurrected from disk on the next miss.
+            if (AddToMemoryCache(fullKey, item, absoluteExpiration, slidingExpiration, priority, removedCallback, refresh))
+            {
+                SaveToPersistentCache(fullKey, item, absoluteExpiration, slidingExpiration);
+            }
 
             return item;
         }
@@ -884,8 +969,10 @@ namespace CacheUtility
             };
             item.RecomputeEstimatedSize();
 
-            AddToMemoryCache(fullKey, item, absoluteExpiration, slidingExpiration, priority, removedCallback, refresh);
-            SaveToPersistentCache(fullKey, item, absoluteExpiration, slidingExpiration);
+            if (AddToMemoryCache(fullKey, item, absoluteExpiration, slidingExpiration, priority, removedCallback, refresh))
+            {
+                SaveToPersistentCache(fullKey, item, absoluteExpiration, slidingExpiration);
+            }
 
             return item;
         }
@@ -982,9 +1069,27 @@ namespace CacheUtility
                 cacheItem?.Dispose();
 
                 // Clean up subkey set so RegisteredKeys/groups don't leak.
-                if (cacheItem != null && _groups.TryGetValue(cacheItem.GroupName, out var subkeys))
+                //
+                // Guarded, because this callback does not only run on the thread that removed the
+                // entry: MemoryCache also fires it from its own background flush of expired items,
+                // which can land after the key has been repopulated. Deregistering unconditionally
+                // would then strip the replacement's group membership and leave it live but
+                // unreachable from _groups: an entry no later RemoveGroup could evict. Every path
+                // through the public API probes MemoryCache before adding, which flushes an expired
+                // predecessor on the calling thread first, so this guard is defense against the
+                // background flush rather than the common case.
+                if (cacheItem != null && _groups.TryGetValue(cacheItem.GroupName, out var group))
                 {
-                    subkeys.TryRemove(args.CacheItem.Key, out _);
+                    var current = MemoryCache.Default.Get(args.CacheItem.Key);
+                    if (current == null || ReferenceEquals(current, cacheItem))
+                    {
+                        group.Keys.TryRemove(args.CacheItem.Key, out _);
+
+                        // A replacement may have been installed between the check above and the
+                        // removal. Re-register it rather than leaving it stranded.
+                        if (MemoryCache.Default.Get(args.CacheItem.Key) != null)
+                            group.Keys.TryAdd(args.CacheItem.Key, 0);
+                    }
                 }
 
                 // Diagnostic: surface entry lifecycle events. We only log evictions that weren't
@@ -1210,13 +1315,30 @@ namespace CacheUtility
             }
         }
 
-        private static void AddToMemoryCache<TData>(string fullKey, CacheItem<TData> item, DateTime absoluteExpiration, TimeSpan slidingExpiration, CacheItemPriority priority, CacheEntryRemovedCallback removedCallback, TimeSpan refresh)
+        /// <summary>
+        /// Publishes <paramref name="item"/> to <c>MemoryCache</c> and registers it in its group.
+        /// </summary>
+        /// <returns>
+        /// <c>true</c> when the entry is installed and reachable; <c>false</c> when a group-wide
+        /// removal ran across this add and the entry was rolled back, in which case the caller must
+        /// not persist it either.
+        /// </returns>
+        /// <remarks>
+        /// Ordering matters here. The value goes into <c>MemoryCache</c> <em>before</em> the key is
+        /// registered in the group, and the group's sweep generation is sampled before both. The
+        /// previous order (register, then publish) left a window in which <see cref="RemoveGroup"/>
+        /// could detach the group and sweep past a key whose value had not landed yet: the entry
+        /// became live but unreachable from <c>_groups</c>, so no later <c>RemoveGroup</c> could ever
+        /// evict it, and it served stale reads until its own TTL expired.
+        /// </remarks>
+        private static bool AddToMemoryCache<TData>(string fullKey, CacheItem<TData> item, DateTime absoluteExpiration, TimeSpan slidingExpiration, CacheItemPriority priority, CacheEntryRemovedCallback removedCallback, TimeSpan refresh)
         {
             var groupName = item.GroupName;
 
-            // Add to (or create) the group's subkey set.
-            var subkeys = _groups.GetOrAdd(groupName, _ => new ConcurrentDictionary<string, byte>(StringComparer.Ordinal));
-            subkeys.TryAdd(fullKey, 0);
+            // Resolve (or create) the group and sample its sweep generation up front. Everything
+            // below is compared against this sample to decide whether a removal overlapped us.
+            var group = _groups.GetOrAdd(groupName, _ => new CacheGroup());
+            var generationBefore = group.Generation;
 
             if (slidingExpiration > MaxSlidingExpiration)
             {
@@ -1231,13 +1353,56 @@ namespace CacheUtility
                 RemovedCallback = CreateCombinedCallback(removedCallback, item)
             };
 
+            // Publish the value first, then make it reachable. A sweep that runs between these two
+            // statements is caught by the generation check below.
             MemoryCache.Default.Add(fullKey, item, cacheItemPolicy);
+            group.Keys.TryAdd(fullKey, 0);
+
+            if (RemovalOverlappedAdd(groupName, group, generationBefore))
+            {
+                // A group-wide removal started after we sampled the generation, so it may have swept
+                // past this key before we registered it. Undo our own add: an invalidation that is
+                // concurrent with a populate must win, otherwise the caller is left holding an entry
+                // that the removal was supposed to have taken out.
+                if (ReferenceEquals(MemoryCache.Default.Get(fullKey), item))
+                {
+                    RemoveByInternalKey(fullKey, knownGroup: groupName);
+                }
+                else
+                {
+                    // Another thread already replaced the entry; just drop our stale registration.
+                    group.Keys.TryRemove(fullKey, out _);
+                }
+
+                Interlocked.Increment(ref _discardedAdds);
+
+                if (_logger.IsEnabled(LogLevel.Debug))
+                    _logger.LogDebug(
+                        "Discarding cache entry {CacheKey} in group {GroupName}: the group was invalidated while the entry was being populated",
+                        item.CacheKey, groupName);
+
+                return false;
+            }
 
             if (refresh > TimeSpan.Zero)
             {
                 item.RefreshInterval = refresh;
                 SetupRefreshTimer(item, fullKey);
             }
+
+            return true;
+        }
+
+        /// <summary>
+        /// Returns <c>true</c> when a group-wide removal has begun on <paramref name="group"/> since
+        /// <paramref name="generationBefore"/> was sampled, or when the holder we registered into is no
+        /// longer the one published in <c>_groups</c> (which <see cref="RemoveAll"/> and
+        /// <see cref="RemoveAllButThese"/> can do), meaning our registration is unreachable.
+        /// </summary>
+        private static bool RemovalOverlappedAdd(string groupName, CacheGroup group, int generationBefore)
+        {
+            if (group.Generation != generationBefore) return true;
+            return !_groups.TryGetValue(groupName, out var current) || !ReferenceEquals(current, group);
         }
 
         private static string GetPersistentCacheFilePath(string fullKey) =>
@@ -1265,13 +1430,19 @@ namespace CacheUtility
             var existing = MemoryCache.Default.Get(fullKey) as ICacheItem;
             existing?.Dispose();
 
-            var group = knownGroup ?? existing?.GroupName;
-            if (group != null && _groups.TryGetValue(group, out var subkeys))
+            var groupName = knownGroup ?? existing?.GroupName;
+
+            // Drop the value before dropping the group registration, never the other way round.
+            // A concurrent RemoveGroup snapshots the group's key set; if a key were deregistered
+            // first, that sweep would skip it while the value was still live and readable, and the
+            // sweep would return claiming the group was empty.
+            MemoryCache.Default.Remove(fullKey);
+
+            if (groupName != null && _groups.TryGetValue(groupName, out var group))
             {
-                subkeys.TryRemove(fullKey, out _);
+                group.Keys.TryRemove(fullKey, out _);
             }
 
-            MemoryCache.Default.Remove(fullKey);
             _inflightSync.TryRemove(fullKey, out _);
             _inflightAsync.TryRemove(fullKey, out _);
 
@@ -1383,9 +1554,9 @@ namespace CacheUtility
             if (string.IsNullOrEmpty(groupName)) throw new ArgumentNullException(nameof(groupName));
 
             var result = new Dictionary<string, object>();
-            if (!_groups.TryGetValue(groupName, out var subkeys)) return result;
+            if (!_groups.TryGetValue(groupName, out var group)) return result;
 
-            foreach (var fullKey in subkeys.Keys)
+            foreach (var fullKey in group.Keys.Keys)
             {
                 var cached = MemoryCache.Default.Get(fullKey);
                 if (cached is ICacheItem ci)
@@ -1414,9 +1585,9 @@ namespace CacheUtility
             if (string.IsNullOrEmpty(groupName)) throw new ArgumentNullException(nameof(groupName));
 
             var result = new Dictionary<string, TData>();
-            if (!_groups.TryGetValue(groupName, out var subkeys)) return result;
+            if (!_groups.TryGetValue(groupName, out var group)) return result;
 
-            foreach (var fullKey in subkeys.Keys)
+            foreach (var fullKey in group.Keys.Keys)
             {
                 if (MemoryCache.Default.Get(fullKey) is CacheItem<TData> typed)
                 {
@@ -1437,7 +1608,7 @@ namespace CacheUtility
             foreach (var groupKvp in _groups)
             {
                 var groupName = groupKvp.Key;
-                foreach (var fullCacheKey in groupKvp.Value.Keys)
+                foreach (var fullCacheKey in groupKvp.Value.Keys.Keys)
                 {
                     var cachedItem = MemoryCache.Default.Get(fullCacheKey);
                     if (cachedItem == null) continue;
