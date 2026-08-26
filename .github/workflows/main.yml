@@ -3,8 +3,13 @@ name: Deploy NuGet Package
 on:
   workflow_dispatch:  # Enables manual trigger
   push:
+    branches:
+      - production  # Triggers when changes land on the production branch (e.g. via merge)
     tags:
       - 'v*'  # Triggers on version tags like v1.0.0
+
+permissions:
+  contents: write  # Needed so the "Tag release" step below can push a tag with the default token.
 
 jobs:
   build-and-publish:
@@ -31,3 +36,24 @@ jobs:
       - name: Push to NuGet
         shell: bash
         run: dotnet nuget push ./nupkg/*.nupkg --api-key ${{ secrets.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
+
+      - name: Tag release
+        # Only when this run is a direct push to production - not for a tag push (would tag itself
+        # again) and not for a manual workflow_dispatch (which may target any branch). The version
+        # is read from the csproj rather than invented here, so bumping it is still a normal part of
+        # the change you merge; this step just turns "merged into production" into the release tag,
+        # instead of that being a separate manual `git tag` + `git push` step afterwards.
+        if: github.ref == 'refs/heads/production'
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path CacheUtility.csproj -Pattern '<Version>(.*?)</Version>').Matches[0].Groups[1].Value
+          $tag = "v$version"
+
+          if (git ls-remote --tags origin $tag) {
+            Write-Host "Tag $tag already exists on origin - production was merged without a version bump, nothing to release."
+          } else {
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git tag -a $tag -m "Release $tag"
+            git push origin $tag
+          }
