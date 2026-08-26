@@ -90,6 +90,37 @@ namespace CacheUtility
         }
 
         /// <summary>
+        /// Snapshot of a group's sweep state, captured by <see cref="CaptureSweepToken"/> at the
+        /// start of a populate - before the populate method (or the persistent-cache read) produces
+        /// the value. <see cref="AddToMemoryCache{TData}"/> compares the group's state against this
+        /// token after installing the entry; any group-wide removal that began in between rolls the
+        /// entry back. Capturing at populate start rather than at add time matters: a populate reads
+        /// its source data first, so an invalidation issued while it runs refers to data the populate
+        /// may already have read, and its result must not be retained.
+        /// </summary>
+        private readonly struct GroupSweepToken
+        {
+            internal GroupSweepToken(CacheGroup group)
+            {
+                Group = group;
+                Generation = group.Generation;
+            }
+
+            /// <summary>The group holder that was published in <see cref="_groups"/> at capture time.</summary>
+            internal readonly CacheGroup Group;
+
+            /// <summary>The holder's sweep generation at capture time.</summary>
+            internal readonly int Generation;
+        }
+
+        /// <summary>
+        /// Captures the named group's current sweep state, creating the group holder if needed.
+        /// Call before invoking a populate method; pass the token to <see cref="AddToMemoryCache{TData}"/>.
+        /// </summary>
+        private static GroupSweepToken CaptureSweepToken(string groupName) =>
+            new GroupSweepToken(_groups.GetOrAdd(groupName, _ => new CacheGroup()));
+
+        /// <summary>
         /// Group name -> that group's bookkeeping.
         /// <para>
         /// <see cref="RemoveGroup"/> deliberately never detaches a <see cref="CacheGroup"/> from this
@@ -795,13 +826,17 @@ namespace CacheUtility
                 return alreadyThere;
             }
 
+            // Capture the group's sweep state before producing the value (from disk or the populate
+            // method), so an invalidation issued while the value is being produced is detected.
+            var sweepToken = CaptureSweepToken(groupName);
+
             // Try persistent cache first.
             var fromPersistent = LoadFromPersistentCache<TData>(fullKey, cacheKey, groupName, absoluteExpiration, slidingExpiration);
             if (fromPersistent != null)
             {
                 fromPersistent.PopulateMethodCache = populateMethod;
                 fromPersistent.RefreshInterval = refresh;
-                AddToMemoryCache(fullKey, fromPersistent, absoluteExpiration, slidingExpiration, priority, removedCallback, refresh);
+                AddToMemoryCache(fullKey, fromPersistent, absoluteExpiration, slidingExpiration, priority, removedCallback, refresh, sweepToken);
                 return fromPersistent;
             }
 
@@ -831,7 +866,7 @@ namespace CacheUtility
 
             // Skip the persistent write when the entry was rolled back, otherwise the value the
             // invalidation just discarded would be resurrected from disk on the next miss.
-            if (AddToMemoryCache(fullKey, item, absoluteExpiration, slidingExpiration, priority, removedCallback, refresh))
+            if (AddToMemoryCache(fullKey, item, absoluteExpiration, slidingExpiration, priority, removedCallback, refresh, sweepToken))
             {
                 SaveToPersistentCache(fullKey, item, absoluteExpiration, slidingExpiration);
             }
@@ -934,6 +969,10 @@ namespace CacheUtility
                 return alreadyThere;
             }
 
+            // Capture the group's sweep state before producing the value (from disk or the populate
+            // method), so an invalidation issued while the value is being produced is detected.
+            var sweepToken = CaptureSweepToken(groupName);
+
             var fromPersistent = LoadFromPersistentCache<TData>(fullKey, cacheKey, groupName, absoluteExpiration, slidingExpiration);
             if (fromPersistent != null)
             {
@@ -941,7 +980,7 @@ namespace CacheUtility
                 // Without this, persistent-restored async entries silently lose their refresh capability.
                 fromPersistent.PopulateMethodCacheAsync = populateMethod;
                 fromPersistent.RefreshInterval = refresh;
-                AddToMemoryCache(fullKey, fromPersistent, absoluteExpiration, slidingExpiration, priority, removedCallback, refresh);
+                AddToMemoryCache(fullKey, fromPersistent, absoluteExpiration, slidingExpiration, priority, removedCallback, refresh, sweepToken);
                 return fromPersistent;
             }
 
@@ -969,7 +1008,7 @@ namespace CacheUtility
             };
             item.RecomputeEstimatedSize();
 
-            if (AddToMemoryCache(fullKey, item, absoluteExpiration, slidingExpiration, priority, removedCallback, refresh))
+            if (AddToMemoryCache(fullKey, item, absoluteExpiration, slidingExpiration, priority, removedCallback, refresh, sweepToken))
             {
                 SaveToPersistentCache(fullKey, item, absoluteExpiration, slidingExpiration);
             }
@@ -1016,6 +1055,11 @@ namespace CacheUtility
                     var currentItem = MemoryCache.Default.Get(fullCacheKey) as CacheItem<TData>;
                     if (currentItem == null || currentItem != cacheItem) return;
 
+                    // Captured before the populate runs, for the same reason the populate paths do:
+                    // an invalidation issued while the refresh executes refers to data the refresh
+                    // may already have read, so its result must not be written back.
+                    var sweepToken = CaptureSweepToken(cacheItem.GroupName);
+
                     TData newValue;
                     if (asyncPopulate != null)
                     {
@@ -1029,7 +1073,7 @@ namespace CacheUtility
                         WarnOnTaskReturningSyncPopulate(newValue, syncPopulate, cacheItem.CacheKey, cacheItem.GroupName);
                     }
 
-                    UpdateCacheItemValue(cacheItem, newValue);
+                    UpdateCacheItemValue(cacheItem, newValue, sweepToken);
 
                     if (_logger.IsEnabled(LogLevel.Debug))
                         _logger.LogDebug("Background refresh completed for {CacheKey} in group {GroupName}", cacheItem.CacheKey, cacheItem.GroupName);
@@ -1049,7 +1093,7 @@ namespace CacheUtility
             });
         }
 
-        private static void UpdateCacheItemValue<TData>(CacheItem<TData> cacheItem, TData newValue)
+        private static void UpdateCacheItemValue<TData>(CacheItem<TData> cacheItem, TData newValue, GroupSweepToken sweepToken)
         {
             lock (cacheItem.RefreshLock)
             {
@@ -1057,8 +1101,18 @@ namespace CacheUtility
                 cacheItem.LastRefreshTime = DateTime.Now;
                 cacheItem.RecomputeEstimatedSize();
 
+                // Skip the persistent write when the entry was removed (individually or via a group
+                // sweep) while the refresh was running. An unconditional write here used to resurrect
+                // the file the removal had just deleted, so the next cold read served the
+                // pre-invalidation value from disk. The in-memory fields above are updated regardless:
+                // if the entry was removed they are unreachable, and if it is still live they must
+                // reflect the completed refresh.
                 var fullCacheKey = BuildFullKey(cacheItem.GroupName, cacheItem.CacheKey);
-                SaveToPersistentCache(fullCacheKey, cacheItem, cacheItem.AbsoluteExpiration, cacheItem.SlidingExpiration);
+                if (!RemovalOverlappedAdd(cacheItem.GroupName, sweepToken.Group, sweepToken)
+                    && ReferenceEquals(MemoryCache.Default.Get(fullCacheKey), cacheItem))
+                {
+                    SaveToPersistentCache(fullCacheKey, cacheItem, cacheItem.AbsoluteExpiration, cacheItem.SlidingExpiration);
+                }
             }
         }
 
@@ -1325,20 +1379,20 @@ namespace CacheUtility
         /// </returns>
         /// <remarks>
         /// Ordering matters here. The value goes into <c>MemoryCache</c> <em>before</em> the key is
-        /// registered in the group, and the group's sweep generation is sampled before both. The
-        /// previous order (register, then publish) left a window in which <see cref="RemoveGroup"/>
-        /// could detach the group and sweep past a key whose value had not landed yet: the entry
-        /// became live but unreachable from <c>_groups</c>, so no later <c>RemoveGroup</c> could ever
-        /// evict it, and it served stale reads until its own TTL expired.
+        /// registered in the group, and <paramref name="sweepToken"/> holds the group's sweep state
+        /// from before the populate ran. The previous order (register, then publish) left a window in
+        /// which <see cref="RemoveGroup"/> could detach the group and sweep past a key whose value had
+        /// not landed yet: the entry became live but unreachable from <c>_groups</c>, so no later
+        /// <c>RemoveGroup</c> could ever evict it, and it served stale reads until its own TTL expired.
         /// </remarks>
-        private static bool AddToMemoryCache<TData>(string fullKey, CacheItem<TData> item, DateTime absoluteExpiration, TimeSpan slidingExpiration, CacheItemPriority priority, CacheEntryRemovedCallback removedCallback, TimeSpan refresh)
+        private static bool AddToMemoryCache<TData>(string fullKey, CacheItem<TData> item, DateTime absoluteExpiration, TimeSpan slidingExpiration, CacheItemPriority priority, CacheEntryRemovedCallback removedCallback, TimeSpan refresh, GroupSweepToken sweepToken)
         {
             var groupName = item.GroupName;
 
-            // Resolve (or create) the group and sample its sweep generation up front. Everything
-            // below is compared against this sample to decide whether a removal overlapped us.
+            // Resolve (or create) the group holder we register into. Normally this is the same
+            // instance the token captured; when it differs, a bulk reset swapped it while the
+            // populate ran and the overlap check below fires.
             var group = _groups.GetOrAdd(groupName, _ => new CacheGroup());
-            var generationBefore = group.Generation;
 
             if (slidingExpiration > MaxSlidingExpiration)
             {
@@ -1358,7 +1412,7 @@ namespace CacheUtility
             MemoryCache.Default.Add(fullKey, item, cacheItemPolicy);
             group.Keys.TryAdd(fullKey, 0);
 
-            if (RemovalOverlappedAdd(groupName, group, generationBefore))
+            if (RemovalOverlappedAdd(groupName, group, sweepToken))
             {
                 // A group-wide removal started after we sampled the generation, so it may have swept
                 // past this key before we registered it. Undo our own add: an invalidation that is
@@ -1394,14 +1448,16 @@ namespace CacheUtility
         }
 
         /// <summary>
-        /// Returns <c>true</c> when a group-wide removal has begun on <paramref name="group"/> since
-        /// <paramref name="generationBefore"/> was sampled, or when the holder we registered into is no
-        /// longer the one published in <c>_groups</c> (which <see cref="RemoveAll"/> and
-        /// <see cref="RemoveAllButThese"/> can do), meaning our registration is unreachable.
+        /// Returns <c>true</c> when a group-wide removal overlapped the populate whose result was just
+        /// installed: the holder differs from the one captured at populate start (a bulk reset such as
+        /// <see cref="RemoveAll"/> or <see cref="RemoveAllButThese"/> swapped it), a sweep bumped the
+        /// generation since the token was captured, or the holder we registered into is no longer the
+        /// one published in <c>_groups</c>, meaning our registration is unreachable.
         /// </summary>
-        private static bool RemovalOverlappedAdd(string groupName, CacheGroup group, int generationBefore)
+        private static bool RemovalOverlappedAdd(string groupName, CacheGroup group, GroupSweepToken sweepToken)
         {
-            if (group.Generation != generationBefore) return true;
+            if (!ReferenceEquals(group, sweepToken.Group)) return true;
+            if (group.Generation != sweepToken.Generation) return true;
             return !_groups.TryGetValue(groupName, out var current) || !ReferenceEquals(current, group);
         }
 
