@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
@@ -8,9 +8,8 @@ using Xunit;
 namespace CacheUtility.Tests
 {
     /// <summary>
-    /// Reproduction tests for the Booking.Client hang seen in CacheUtility 1.4.0.
-    ///
-    /// Booking's call shape is:
+    /// Tests for caching a Task returned by an async lambda through the synchronous
+    /// <c>Cache.Get</c> overload. The call shape is:
     ///   var result = await Cache.Get(cacheKey, group, DateTime.Now.Add(...),
     ///                                async () => {
     ///                                    var x = await SomeNestedCacheGet();   // another Cache.Get via await
@@ -22,15 +21,15 @@ namespace CacheUtility.Tests
     /// to the synchronous `Cache.Get&lt;TData&gt;` overload with TData = Task&lt;T&gt;. The factory
     /// runs synchronously, returns a Task, the Task is cached, and the caller awaits it.
     ///
-    /// In 1.3.5 this shape worked. In 1.4.0 it hangs — these tests aim to expose where.
+    /// This shape regressed into a hang in 1.4.0 (fixed in 1.4.1); these tests guard it.
     /// </summary>
     [Collection("CacheSerial")]
-    public class BookingReproTests
+    public class AsyncLambdaTaskCachingTests
     {
-        private const string OuterGroup = "BookingRepro_Outer";
-        private const string InnerGroup = "BookingRepro_Inner";
+        private const string OuterGroup = "AsyncLambdaTaskCaching_Outer";
+        private const string InnerGroup = "AsyncLambdaTaskCaching_Inner";
 
-        public BookingReproTests()
+        public AsyncLambdaTaskCachingTests()
         {
             Cache.RemoveGroup(OuterGroup);
             Cache.RemoveGroup(InnerGroup);
@@ -38,7 +37,7 @@ namespace CacheUtility.Tests
 
         private static async Task<List<int>> NestedCacheGetAsync()
         {
-            // Inner Cache.Get with an async lambda, just like booking.mews.MewsRoomTypeService.GetRoomTypesAsync
+            // Inner Cache.Get with an async lambda, nested inside an outer async-lambda Cache.Get.
             return await Cache.Get<Task<List<int>>>(
                 "inner-key",
                 InnerGroup,
@@ -52,12 +51,11 @@ namespace CacheUtility.Tests
         }
 
         /// <summary>
-        /// Exact shape of Booking.Client.Services.MewsRoomTypeService.GetAllRoomTypesAsync.
-        /// Outer Cache.Get with absolute-expiration overload + async lambda that awaits
-        /// an inner Cache.Get. refresh=TimeSpan.Zero.
+        /// Outer Cache.Get with the absolute-expiration overload + an async lambda that
+        /// awaits an inner Cache.Get. refresh=TimeSpan.Zero.
         /// </summary>
         [Fact(Timeout = 15_000)]
-        public async Task BookingPattern_OuterAndInner_BothAsyncLambdas_ShouldNotHang()
+        public async Task AsyncLambdaPattern_OuterAndInner_BothAsyncLambdas_ShouldNotHang()
         {
             var task = Cache.Get<Task<List<int>>>(
                 "outer-key",
@@ -80,7 +78,7 @@ namespace CacheUtility.Tests
         /// rather than re-running the factory, and must not hang.
         /// </summary>
         [Fact(Timeout = 15_000)]
-        public async Task BookingPattern_SecondCall_HitsCache()
+        public async Task AsyncLambdaPattern_SecondCall_HitsCache()
         {
             int invocations = 0;
 
@@ -113,7 +111,7 @@ namespace CacheUtility.Tests
         /// Exercises _inflightSync single-flight with async lambdas.
         /// </summary>
         [Fact(Timeout = 15_000)]
-        public async Task BookingPattern_ConcurrentCallers_AllComplete()
+        public async Task AsyncLambdaPattern_ConcurrentCallers_AllComplete()
         {
             int invocations = 0;
 
@@ -142,11 +140,11 @@ namespace CacheUtility.Tests
 
         /// <summary>
         /// Run on a dedicated thread that has a custom SynchronizationContext that posts
-        /// continuations back onto itself. This mimics Blazor Server's RendererSynchronizationContext
-        /// which is the environment in which Booking actually runs when the hang was observed.
+        /// continuations back onto itself. This mimics Blazor Server's RendererSynchronizationContext,
+        /// the environment in which the original hang was observed.
         /// </summary>
         [Fact(Timeout = 15_000)]
-        public async Task BookingPattern_UnderSingleThreadedSyncContext_DoesNotDeadlock()
+        public async Task AsyncLambdaPattern_UnderSingleThreadedSyncContext_DoesNotDeadlock()
         {
             var ctx = new SingleThreadSynchronizationContext();
             var worker = new System.Threading.Thread(() => ctx.RunLoop()) { IsBackground = true };
@@ -194,11 +192,11 @@ namespace CacheUtility.Tests
         /// </summary>
         private sealed class SingleThreadSynchronizationContext : System.Threading.SynchronizationContext, IDisposable
         {
-            private readonly System.Collections.Concurrent.BlockingCollection<(System.Threading.SendOrPostCallback cb, object st)> _queue
-                = new System.Collections.Concurrent.BlockingCollection<(System.Threading.SendOrPostCallback, object)>();
+            private readonly System.Collections.Concurrent.BlockingCollection<(System.Threading.SendOrPostCallback cb, object? st)> _queue
+                = new System.Collections.Concurrent.BlockingCollection<(System.Threading.SendOrPostCallback, object?)>();
 
-            public override void Post(System.Threading.SendOrPostCallback d, object state) => _queue.Add((d, state));
-            public override void Send(System.Threading.SendOrPostCallback d, object state) => d(state);
+            public override void Post(System.Threading.SendOrPostCallback d, object? state) => _queue.Add((d, state));
+            public override void Send(System.Threading.SendOrPostCallback d, object? state) => d(state);
 
             public void RunLoop()
             {
