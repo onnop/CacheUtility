@@ -154,6 +154,56 @@ namespace CacheUtility.Tests
         }
 
         // -----------------------------------------------------------------
+        // Persist writes an in-place change to disk, so a restart loads the
+        // latest value instead of the value as first populated.
+        // -----------------------------------------------------------------
+        [Fact]
+        public void Persist_InPlaceMutation_SurvivesRestart()
+        {
+            const string group = "persistMutationGroup";
+            Cache.EnablePersistentCache(new PersistentCacheOptions
+            {
+                BaseDirectory = _tempDir,
+                PersistentGroups = new[] { group }
+            });
+
+            var set = Cache.Get("k", group, TimeSpan.FromMinutes(30), () => new HashSet<string>());
+            set.Add("added-after-populate");
+
+            Cache.RemoveAllFromMemoryOnly();
+            Assert.Empty(Cache.Get("k", group, TimeSpan.FromMinutes(30), () => new HashSet<string> { "populate-ran" }));
+
+            set = Cache.Get("k", group, TimeSpan.FromMinutes(30), () => new HashSet<string>());
+            set.Add("added-after-populate");
+            Assert.True(Cache.Persist("k", group));
+
+            Cache.RemoveAllFromMemoryOnly();
+            var restored = Cache.Get("k", group, TimeSpan.FromMinutes(30), () => new HashSet<string> { "populate-ran" });
+            Assert.Equal(new[] { "added-after-populate" }, restored);
+        }
+
+        [Fact]
+        public void Persist_ReturnsFalse_WhenNothingToWrite()
+        {
+            const string group = "persistNoopGroup";
+            Cache.EnablePersistentCache(new PersistentCacheOptions
+            {
+                BaseDirectory = _tempDir,
+                PersistentGroups = new[] { group }
+            });
+
+            Assert.False(Cache.Persist("missing", group));
+
+            Cache.Get("k", "notPersistentGroup", () => "v");
+            Assert.False(Cache.Persist("k", "notPersistentGroup"));
+
+            Cache.Get("k", group, () => "v");
+            Cache.Remove("k", group);
+            Assert.False(Cache.Persist("k", group));
+            Assert.Empty(Directory.GetFiles(_tempDir, "*.cache"));
+        }
+
+        // -----------------------------------------------------------------
         // Persistent statistics still work after the rewrite.
         // -----------------------------------------------------------------
         [Fact]

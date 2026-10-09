@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.7] - 2026-10-09
+
+### Added
+- `Cache.Persist(cacheKey, groupName)` writes the current in-memory value of an existing entry to the persistent cache. The persistent cache was only written on populate and background refresh, so a cached object changed in place afterwards (a session, a set) was restored after a restart as it was first populated. There was no way to fix that from the caller short of `Remove` plus a new `Get`, which leaves a window in which a concurrent reader populates a fresh value.
+- `Persist` takes the entry's refresh lock, so it never interleaves with a background-refresh write-back, and deletes its own files again when a `Remove` overlapped the write, so a removed value is not resurrected from disk.
+- Tests: `PersistentCacheHardeningTests.Persist_InPlaceMutation_SurvivesRestart` (shows the restart loss without `Persist`, then the fix) and `Persist_ReturnsFalse_WhenNothingToWrite`.
+
+### Notes
+- 100% backward compatible. One new public method; no existing behaviour changes.
+
 ## [1.4.6] - 2026-08-26
 
 ### Fixed
@@ -12,33 +22,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - This is not a corner case in multi-user applications. Any service that invalidates a group on every write, while other requests concurrently populate the same group, is exposed on every overlap. A 4-thread invalidation load orphaned **1,421 of 4,000** entries (~35%); with the invalidation threads removed, zero. Long TTLs make it worse: a 10-minute entry orphaned this way serves stale data for the full ten minutes with no way to flush it.
 
 ### How it is fixed
-- Group membership now lives in a `CacheGroup` holder that carries the key set plus a **sweep generation** counter, and `RemoveGroup` never detaches that holder — it bumps the generation and drains the group **in place**. Because the holder is never swapped out, a concurrent add can no longer end up writing into a dictionary nobody can reach.
-- The group's sweep generation is sampled **before the populate runs** (and before the persistent-cache read), not at insert time. `AddToMemoryCache` publishes the value to `MemoryCache` first, then registers the key, then compares the group's state against that pre-populate sample: if a sweep began in between (or `RemoveAll` / `RemoveAllButThese` swapped the holder), it rolls its own entry back and returns `false`. A group invalidation concurrent with a populate now always wins — including one issued *while the populate is still reading its source data*, whose result may predate the write that triggered the invalidation. The persistent-cache write is skipped for a rolled-back entry, so the discarded value is not resurrected from disk on the next miss.
+- Group membership now lives in a `CacheGroup` holder that carries the key set plus a **sweep generation** counter, and `RemoveGroup` never detaches that holder - it bumps the generation and drains the group **in place**. Because the holder is never swapped out, a concurrent add can no longer end up writing into a dictionary nobody can reach.
+- The group's sweep generation is sampled **before the populate runs** (and before the persistent-cache read), not at insert time. `AddToMemoryCache` publishes the value to `MemoryCache` first, then registers the key, then compares the group's state against that pre-populate sample: if a sweep began in between (or `RemoveAll` / `RemoveAllButThese` swapped the holder), it rolls its own entry back and returns `false`. A group invalidation concurrent with a populate now always wins - including one issued *while the populate is still reading its source data*, whose result may predate the write that triggered the invalidation. The persistent-cache write is skipped for a rolled-back entry, so the discarded value is not resurrected from disk on the next miss.
 - `RemoveByInternalKey` now removes the value from `MemoryCache` **before** dropping the group registration. The old order deregistered first, which let a concurrent `RemoveGroup` snapshot skip a key whose value was still live and readable, and return claiming the group was empty.
-- The background-refresh write-back is guarded the same way: the refresh task captures the group's sweep state before re-invoking the populate, and `UpdateCacheItemValue` skips the persistent write when a removal overlapped the refresh or the entry is no longer the cache resident. Previously the refresh wrote its result to the persistent cache unconditionally, resurrecting the file a concurrent `RemoveGroup` had just deleted — the next cold read then served the pre-invalidation value from disk.
-- The entry-removal callback only deregisters a key when it is not occupied by a replacement entry, and re-registers one that appears underneath it. `MemoryCache` also fires that callback from its own background flush of expired items, which can land after the key has been repopulated; deregistering unconditionally would strip the replacement's group membership. This one is defensive — every path through the public API probes `MemoryCache` before adding, which flushes an expired predecessor on the calling thread first.
+- The background-refresh write-back is guarded the same way: the refresh task captures the group's sweep state before re-invoking the populate, and `UpdateCacheItemValue` skips the persistent write when a removal overlapped the refresh or the entry is no longer the cache resident. Previously the refresh wrote its result to the persistent cache unconditionally, resurrecting the file a concurrent `RemoveGroup` had just deleted - the next cold read then served the pre-invalidation value from disk.
+- The entry-removal callback only deregisters a key when it is not occupied by a replacement entry, and re-registers one that appears underneath it. `MemoryCache` also fires that callback from its own background flush of expired items, which can land after the key has been repopulated; deregistering unconditionally would strip the replacement's group membership. This one is defensive - every path through the public API probes `MemoryCache` before adding, which flushes an expired predecessor on the calling thread first.
 
 ### Added
 - `GroupRemovalRaceTests.RemoveGroup_ConcurrentWithPopulate_NeverOrphansEntries`: 4,000 cycles of populate → `RemoveGroup` → re-read, with four background threads hammering `RemoveGroup` on the same group. Each cycle asserts the populate ran again, i.e. that a `RemoveGroup` starting *after* the populate completed actually evicted the entry. Reproduces the bug deterministically (1,421 orphans pre-fix, 0 post-fix) and additionally asserts that at least one add really did overlap a removal, so the test cannot pass vacuously if the window never opens.
 - `GroupRemovalRaceTests.RemoveGroup_TrueConcurrentWithSyncPopulate_LeavesNoUnreachableEntries`: 1,000 rounds releasing eight synchronous populates and one `RemoveGroup` simultaneously through a gate, then asserting that a subsequent quiescent `RemoveGroup` clears everything the racing one left behind.
-- `GroupRemovalRaceTests.RemoveGroup_DuringAsyncPopulate_DiscardsThePopulatedValue` / `RemoveGroup_DuringSyncPopulate_DiscardsThePopulatedValue`: gate a populate mid-flight, invalidate the group, then release it — the caller receives its computed value but the cache must not retain it.
+- `GroupRemovalRaceTests.RemoveGroup_DuringAsyncPopulate_DiscardsThePopulatedValue` / `RemoveGroup_DuringSyncPopulate_DiscardsThePopulatedValue`: gate a populate mid-flight, invalidate the group, then release it - the caller receives its computed value but the cache must not retain it.
 - `GroupRemovalRaceTests.RemoveGroup_DuringBackgroundRefresh_DoesNotResurrectPersistentEntry`: gates a background refresh mid-populate with persistent cache enabled, invalidates the group, and asserts the deleted persistent files stay deleted.
 - Internal test hooks (`DiscardedAddCount`, `InspectForTesting`) used by those assertions to distinguish "value gone but registration stale" from "registration gone but value live" when a failure is reported.
 
 ### Notes
 - 100% backward compatible. No public API surface changes.
-- Behavioural change worth knowing: a populate whose group is invalidated while it is running no longer caches its result. The caller still receives the value it computed; it is simply not retained, because the invalidation that overlapped it wins. Under a continuous stream of `RemoveGroup` calls on a group, entries in that group will therefore not stick — which is the correct reading of the caller's own invalidation.
+- Behavioural change worth knowing: a populate whose group is invalidated while it is running no longer caches its result. The caller still receives the value it computed; it is simply not retained, because the invalidation that overlapped it wins. Under a continuous stream of `RemoveGroup` calls on a group, entries in that group will therefore not stick - which is the correct reading of the caller's own invalidation.
 - `RemoveGroup` now leaves an empty group holder behind (a few dozen bytes per distinct group name) rather than removing the map entry. Group names are a bounded, application-defined set; `RemoveAll` and `RemoveAllButThese` still reclaim the holders.
 
 ## [1.4.5] - 2026-05-16
 
 ### Fixed
 - **Background auto-refresh was a no-op for entries created via `Cache.GetAsync`.** Since the `GetAsync` family shipped in 1.4.0, passing a `refresh` interval had no effect on async entries: the populate delegate was never stored on the `CacheItem<T>`, so both the periodic timer and the on-access refresh probe early-returned and the populate method was never re-invoked. Entries stayed at their initial value until they expired, defeating the documented "non-blocking background refresh" pattern for the entire async API surface. Sync entries (`Cache.Get`) were unaffected.
-- The fix adds a separate `PopulateMethodCacheAsync` slot on `CacheItem<T>` (the existing `PopulateMethodCache` slot can't be reused because the delegate signatures differ — `Func<T>` vs `Func<Task<T>>`). `CreateAndStoreCacheItemAsync` now stores the async delegate on both the fresh-populate and persistent-restore paths, `SetupRefreshTimer` arms the timer when either populate slot is set, and `StartBackgroundRefresh` awaits the async populate inside its `Task.Run` so we never sync-over-async.
+- The fix adds a separate `PopulateMethodCacheAsync` slot on `CacheItem<T>` (the existing `PopulateMethodCache` slot can't be reused because the delegate signatures differ - `Func<T>` vs `Func<Task<T>>`). `CreateAndStoreCacheItemAsync` now stores the async delegate on both the fresh-populate and persistent-restore paths, `SetupRefreshTimer` arms the timer when either populate slot is set, and `StartBackgroundRefresh` awaits the async populate inside its `Task.Run` so we never sync-over-async.
 
 ### Added
-- `NewApiTests.GetAsync_WithAutoRefresh_RefreshesInBackgroundOnAccess`: covers the fast-path refresh probe — populate is re-invoked after a subsequent `GetAsync` call that follows the refresh interval.
-- `NewApiTests.GetAsync_WithAutoRefresh_TimerRefreshesWithoutAccess`: covers the periodic timer — populate is re-invoked on a schedule without any further `GetAsync` access. Both tests reproduce the pre-1.4.5 bug deterministically (populate stays at `calls == 1`) and pass after the fix.
+- `NewApiTests.GetAsync_WithAutoRefresh_RefreshesInBackgroundOnAccess`: covers the fast-path refresh probe - populate is re-invoked after a subsequent `GetAsync` call that follows the refresh interval.
+- `NewApiTests.GetAsync_WithAutoRefresh_TimerRefreshesWithoutAccess`: covers the periodic timer - populate is re-invoked on a schedule without any further `GetAsync` access. Both tests reproduce the pre-1.4.5 bug deterministically (populate stays at `calls == 1`) and pass after the fix.
 
 ### Notes
 - The `NormalizeRefresh` anti-thrash guard still silently clamps `refresh < 1 second` to zero. Callers expecting sub-second refresh should consider that intentional behavior rather than a bug.
@@ -47,7 +57,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.4.4] - 2026-05-16
 
 ### Fixed
-- **Async single-flight race in `Cache.GetAsync`.** The in-flight dictionary previously stored bare `Task<object>` values and relied on `ConcurrentDictionary.GetOrAdd` to dedup concurrent populates. `GetOrAdd`'s factory may be invoked multiple times under contention — this is documented behavior, with the docs warning that *"valueFactory may be called multiple times"*. When several threads raced into a cold key simultaneously, the user's `populateMethod` could therefore run more than once, even though only one resulting `Task` was ultimately retained in the dictionary.
+- **Async single-flight race in `Cache.GetAsync`.** The in-flight dictionary previously stored bare `Task<object>` values and relied on `ConcurrentDictionary.GetOrAdd` to dedup concurrent populates. `GetOrAdd`'s factory may be invoked multiple times under contention - this is documented behavior, with the docs warning that *"valueFactory may be called multiple times"*. When several threads raced into a cold key simultaneously, the user's `populateMethod` could therefore run more than once, even though only one resulting `Task` was ultimately retained in the dictionary.
 - The fix wraps the in-flight value in `Lazy<Task<object>>` with `LazyThreadSafetyMode.ExecutionAndPublication`, mirroring the pattern already used by the sync path's `_inflightSync`. The `Lazy` guarantees the factory runs exactly once even when multiple threads call `GetOrAdd` simultaneously.
 
 ### Added
@@ -69,7 +79,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Persistent-cache consumers (post-1.4.0) could previously see `Save`, `Load`, and the next `Cache miss` but had no visibility into the intervening expiration event. This gap made it impossible to audit whether a group's TTL ever actually fired, or whether background refresh was keeping entries warm indefinitely. With 1.4.3 the full lifecycle `Save → Load → Expired → Miss → Save` is visible at `Debug`.
 
 ### Notes
-- Zero new public APIs. Control the volume via your existing `LogLevel` configuration and Serilog filters — setting CacheUtility to `Information` or higher silences the new expiration logs while keeping the louder memory-pressure signal.
+- Zero new public APIs. Control the volume via your existing `LogLevel` configuration and Serilog filters - setting CacheUtility to `Information` or higher silences the new expiration logs while keeping the louder memory-pressure signal.
 - 100% backward compatible.
 
 ## [1.4.2] - 2026-04-20
@@ -94,7 +104,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **`GetAsync<T>` overloads** mirroring the synchronous `Get` family. Async populate methods (`Func<Task<T>>`) are now supported with the same single-flight de-duplication semantics as the sync path. Optional `CancellationToken` parameter on the full overload.
 - **Generic `GetAllByGroup<T>(string groupName)`** that returns `Dictionary<string, T>` directly, skipping boxing and reflection. Items whose stored type does not match `T` are skipped.
-- **`TryGet<T>(string cacheKey, string groupName, out T value)`** — peek at the in-memory cache without invoking any populate method.
+- **`TryGet<T>(string cacheKey, string groupName, out T value)`** - peek at the in-memory cache without invoking any populate method.
 - Internal `ICacheItem` interface that lets the cache infrastructure introspect cache items without reflection.
 
 ### Changed (performance)
@@ -109,7 +119,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed (correctness)
 - **`CacheItem<T>.RefreshLock`** now returns the same monitor object across all calls. Previously, if the field was ever uninitialized (e.g. after deserialization), every call returned a brand-new `object`, which made the lock useless and allowed concurrent background refreshes for the same key.
 - **Persistent sliding expiration** now actually slides: `LastAccessTime` is updated on read (not only on save), throttled to ~10% of the sliding window to bound write amplification.
-- **`RemoveGroup` is now cycle-safe** — a circular dependency between groups (e.g. A → B → A) used to cause a `StackOverflowException`. Each group is processed at most once per invocation.
+- **`RemoveGroup` is now cycle-safe** - a circular dependency between groups (e.g. A → B → A) used to cause a `StackOverflowException`. Each group is processed at most once per invocation.
 - **Group bookkeeping leak fixed**: when `MemoryCache` evicts an item on its own (memory pressure, expiration), the entry is now removed from the owning group's subkey set via the removal callback.
 - **`SetDependencies`** is now thread-safe and idempotent. Calling it twice for the same group replaces the previous dependencies (used to throw `ArgumentException`).
 - **`_logger` field** is now `volatile` for safe publication across threads when `ConfigureLogging` is called from a non-startup thread.
@@ -138,7 +148,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Warning-level logging for failed background refresh operations
 - **DI integration** with `services.AddCacheLogging()` extension method
   - Automatically wires the application's `ILoggerFactory` into CacheUtility on host startup via `IHostedService`
-  - Zero manual configuration — no need to call `Cache.ConfigureLogging()` explicitly
+  - Zero manual configuration - no need to call `Cache.ConfigureLogging()` explicitly
 - **Manual configuration** via `Cache.ConfigureLogging(ILoggerFactory)` for non-DI scenarios
 
 ### Technical details
@@ -229,7 +239,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### From v1.2.x to v1.3.0
 
-**Fully backward compatible** — no breaking changes!
+**Fully backward compatible** - no breaking changes!
 
 #### New features available:
 1. **DI-based logging** (recommended):
