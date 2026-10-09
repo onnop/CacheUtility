@@ -35,6 +35,7 @@ namespace CacheUtility
         string PopulateMethodName { get; }
         long? CachedEstimatedSize { get; }
         Type DataType { get; }
+        bool Persist();
     }
 
     /// <summary>
@@ -126,7 +127,7 @@ namespace CacheUtility
         /// <see cref="RemoveGroup"/> deliberately never detaches a <see cref="CacheGroup"/> from this
         /// dictionary; it drains the group in place. A detached group would still be referenced by any
         /// concurrent add that had already resolved it, so keys registered there afterwards would be
-        /// unreachable from <c>_groups</c> forever — entries that no later <c>RemoveGroup</c> could
+        /// unreachable from <c>_groups</c> forever - entries that no later <c>RemoveGroup</c> could
         /// evict. The empty holder left behind is a few dozen bytes per distinct group name; the bulk
         /// reset operations (<see cref="RemoveAll"/>, <see cref="RemoveAllButThese"/>) reclaim it, and
         /// adds detect that detachment via the same generation handshake.
@@ -175,9 +176,9 @@ namespace CacheUtility
         /// <para>
         /// Wrapped in <see cref="Lazy{T}"/> with <see cref="LazyThreadSafetyMode.ExecutionAndPublication"/>
         /// so that even when <see cref="ConcurrentDictionary{TKey,TValue}.GetOrAdd(TKey,System.Func{TKey,TValue})"/>'s
-        /// factory races under contention (documented behavior — the factory may be invoked multiple times),
+        /// factory races under contention (documented behavior - the factory may be invoked multiple times),
         /// only ONE Task is ever materialized. Without this, the populate method could fire 2–3× on cold
-        /// start when multiple threads race to populate the same key — observed downstream as duplicate API calls.
+        /// start when multiple threads race to populate the same key - observed downstream as duplicate API calls.
         /// </para>
         /// </summary>
         private static readonly ConcurrentDictionary<string, Lazy<Task<object>>> _inflightAsync =
@@ -369,6 +370,52 @@ namespace CacheUtility
             }
             value = default;
             return false;
+        }
+
+        /// <summary>
+        /// Writes the current in-memory value of an existing entry to the persistent cache.
+        /// <para>
+        /// The persistent cache is written when an entry is populated or background-refreshed.
+        /// A cached reference type changed in place afterwards (a session object, a set) stays
+        /// in memory only, so after a restart it would load as it was first populated. Call this
+        /// after such a change. Do not mutate the value on another thread while this runs: the
+        /// serializer would see a half-applied change, and the write is then skipped.
+        /// </para>
+        /// Returns false when persistence is disabled, the group is not persistent, the entry is
+        /// not in memory, or the write failed. The in-memory value is never affected.
+        /// </summary>
+        public static bool Persist(string cacheKey, string groupName)
+        {
+            if (string.IsNullOrEmpty(cacheKey)) throw new ArgumentNullException(nameof(cacheKey));
+            if (string.IsNullOrEmpty(groupName)) throw new ArgumentNullException(nameof(groupName));
+
+            if (_persistentOptions == null || !ShouldPersistItem(groupName)) return false;
+
+            return MemoryCache.Default.Get(BuildFullKey(groupName, cacheKey)) is ICacheItem item && item.Persist();
+        }
+
+        private static bool PersistCurrentValue<TData>(CacheItem<TData> cacheItem)
+        {
+            var fullKey = BuildFullKey(cacheItem.GroupName, cacheItem.CacheKey);
+
+            // Same lock as the background-refresh write-back, so the two never interleave their files.
+            lock (cacheItem.RefreshLock)
+            {
+                if (!ReferenceEquals(MemoryCache.Default.Get(fullKey), cacheItem)) return false;
+
+                cacheItem.RecomputeEstimatedSize();
+                var written = SaveToPersistentCache(fullKey, cacheItem, cacheItem.AbsoluteExpiration, cacheItem.SlidingExpiration);
+
+                // A Remove that ran during the write deleted the files before we wrote them.
+                // Delete ours so the removed value is not resurrected on the next cold read.
+                if (MemoryCache.Default.Get(fullKey) == null)
+                {
+                    RemoveFromPersistentCache(fullKey);
+                    return false;
+                }
+
+                return written;
+            }
         }
 
         // =====================================================================
@@ -912,8 +959,8 @@ namespace CacheUtility
         /// <summary>
         /// Returns a stable, site-unique identifier for a populate delegate, suitable for deduplicating
         /// diagnostics. Unlike <see cref="GetMethodName"/>, compiler-generated lambdas and async state
-        /// machines return the fully-qualified declaring-type+method name — which encodes the enclosing
-        /// user method — so different call sites get different keys.
+        /// machines return the fully-qualified declaring-type+method name - which encodes the enclosing
+        /// user method - so different call sites get different keys.
         /// </summary>
         private static string GetPopulateSiteKey(Delegate method)
         {
@@ -1149,7 +1196,7 @@ namespace CacheUtility
                 // Diagnostic: surface entry lifecycle events. We only log evictions that weren't
                 // initiated by the caller (Cache.Remove / RemoveGroup already log at Debug). This
                 // lets consumers see when a TTL actually fires vs. when background refresh keeps
-                // an entry warm — critical for auditing persistent-cache effectiveness.
+                // an entry warm - critical for auditing persistent-cache effectiveness.
                 if (cacheItem != null && _logger != NullLogger.Instance)
                 {
                     switch (args.RemovedReason)
@@ -1162,7 +1209,7 @@ namespace CacheUtility
                             break;
 
                         case CacheEntryRemovedReason.Evicted:
-                            // Memory pressure — rare and worth a louder level.
+                            // Memory pressure - rare and worth a louder level.
                             if (_logger.IsEnabled(LogLevel.Information))
                                 _logger.LogInformation(
                                     "Cache entry evicted under memory pressure: {CacheKey} in group {GroupName}",
@@ -1182,7 +1229,7 @@ namespace CacheUtility
         private static void SetupRefreshTimer<T>(CacheItem<T> cacheItem, string fullCacheKey)
         {
             if (cacheItem.RefreshInterval <= TimeSpan.Zero) return;
-            // Either populate slot is sufficient — sync entries fill PopulateMethodCache,
+            // Either populate slot is sufficient - sync entries fill PopulateMethodCache,
             // async entries (GetAsync) fill PopulateMethodCacheAsync.
             if (cacheItem.PopulateMethodCache == null && cacheItem.PopulateMethodCacheAsync == null) return;
 
@@ -1292,11 +1339,11 @@ namespace CacheUtility
             }
         }
 
-        private static void SaveToPersistentCache<TData>(string fullKey, CacheItem<TData> cacheItem, DateTime absoluteExpiration, TimeSpan slidingExpiration)
+        private static bool SaveToPersistentCache<TData>(string fullKey, CacheItem<TData> cacheItem, DateTime absoluteExpiration, TimeSpan slidingExpiration)
         {
             var options = _persistentOptions;
-            if (options == null) return;
-            if (!ShouldPersistItem(cacheItem.GroupName)) return;
+            if (options == null) return false;
+            if (!ShouldPersistItem(cacheItem.GroupName)) return false;
 
             try
             {
@@ -1323,7 +1370,7 @@ namespace CacheUtility
 
                 if (options.MaxFileSize > 0 && System.Text.Encoding.UTF8.GetByteCount(dataJson) > options.MaxFileSize)
                 {
-                    return;
+                    return false;
                 }
 
                 var metaJson = JsonSerializer.Serialize(metadata, CacheJsonOptions);
@@ -1332,10 +1379,12 @@ namespace CacheUtility
                 // logic will remove the dangling .cache file on next cleanup pass.
                 WriteFileAtomic(cacheFilePath, dataJson);
                 WriteFileAtomic(metaFilePath, metaJson);
+                return true;
             }
             catch
             {
                 // Persistence is best-effort; in-memory cache always works.
+                return false;
             }
         }
 
@@ -2015,6 +2064,8 @@ namespace CacheUtility
             /// a single shared monitor is returned across all calls (including post-deserialization).
             /// </summary>
             public object RefreshLock => LazyInitializer.EnsureInitialized(ref _refreshLock, () => new object());
+
+            bool ICacheItem.Persist() => PersistCurrentValue(this);
 
             /// <summary>
             /// Recompute and cache the estimated serialized size for the current value.

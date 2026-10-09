@@ -16,13 +16,13 @@ CacheUtility provides an easy-to-use abstraction over the standard .NET memory c
 - **Various expiration strategies** (sliding and absolute)
 - **Thread-safe, lock-free hot paths** powered by `ConcurrentDictionary` and `Lazy<T>` populate dedup
 - **Support for cache groups** for organized data management
-- **Strongly-typed bulk access** via `GetAllByGroup<T>()` — no boxing, no reflection
+- **Strongly-typed bulk access** via `GetAllByGroup<T>()` - no boxing, no reflection
 - **Peek without populating** via `TryGet<T>()` for cache-only lookups
 - **Dependency relationships** between cache groups (cycle-safe)
 - **Automatic background refresh** functionality for non-blocking updates
 - **Persistent cache storage** with atomic file writes that survives application restarts
 - **Comprehensive metadata and monitoring** for cache analysis and debugging
-- **Built-in diagnostic logging** with `services.AddCacheLogging()` — zero-config DI integration
+- **Built-in diagnostic logging** with `services.AddCacheLogging()` - zero-config DI integration
 
 ## Installation
 
@@ -40,7 +40,7 @@ dotnet add package CacheUtility
 
 ### PackageReference
 ```xml
-<PackageReference Include="CacheUtility" Version="1.4.6" />
+<PackageReference Include="CacheUtility" Version="1.4.7" />
 ```
 
 ## Quick Start
@@ -122,7 +122,7 @@ synchronous `Get`. This avoids blocking the calling thread while the value is be
 shares a single in-flight populate `Task` across all concurrent callers for the same key.
 
 ```csharp
-// Async populate — 30-minute sliding default
+// Async populate - 30-minute sliding default
 var user = await Cache.GetAsync($"user_{id}", "users", () => userRepo.LoadAsync(id));
 
 // Async populate with explicit sliding expiration
@@ -138,7 +138,7 @@ var report = await Cache.GetAsync("dailyReport", "reports",
 ```
 
 **Notes**:
-- Cancellation only cancels the awaiting caller — other waiters on the same in-flight populate continue.
+- Cancellation only cancels the awaiting caller - other waiters on the same in-flight populate continue.
 - A failed populate (`Task` faults) is not cached. The next call retries.
 - Mixing sync `Get` and `GetAsync` for the same key is allowed but generally not recommended.
 
@@ -261,6 +261,18 @@ When persistent cache is enabled:
 2. **Automatic persistence**: Data is automatically saved to disk in JSON format
 3. **Seamless fallback**: If memory cache is cleared, data is loaded from disk automatically
 4. **Transparent operation**: All existing cache APIs work exactly the same
+
+### Persisting in-place changes
+
+Data is written to disk when it is populated and on every background refresh. A cached object that you change in place afterwards is only changed in memory, so after a restart it loads as it was first populated. Call `Persist` after such a change:
+
+```csharp
+var session = Cache.Get(sessionId, "sessions", TimeSpan.FromMinutes(30), () => new Session());
+session.Step = "payment";
+Cache.Persist(sessionId, "sessions"); // writes the current value to disk
+```
+
+`Persist` returns `false` when persistence is off, the group is not persistent, the key is not in memory, or the write failed; the in-memory value is never affected. Do not change the object on another thread while `Persist` runs.
 
 ### File structure
 
@@ -1155,7 +1167,7 @@ if (Cache.TryGet<MyType>("MyKey", "MyGroup", out _)) { /* present */ }
 
 Numbers below were produced with [BenchmarkDotNet](https://benchmarkdotnet.org/) v0.14.0 on
 .NET 9.0.15 (Windows 11, x64, Concurrent Server GC). The benchmark project lives in
-`CacheUtility.Benchmarks/` — re-run it on your own hardware with:
+`CacheUtility.Benchmarks/` - re-run it on your own hardware with:
 
 ```bash
 dotnet run --project CacheUtility.Benchmarks --configuration Release -- --filter *
@@ -1247,4 +1259,4 @@ CacheUtility logs under the `"CacheUtility"` source name. Use your logging frame
 | Background refresh fail | Warning | `Background refresh failed for {CacheKey}` |
 | Persistent cache enabled | Debug | `Enabling persistent cache (directory: ...)` |
 
-When logging is not configured, `NullLogger` is used — zero overhead.
+When logging is not configured, `NullLogger` is used - zero overhead.
