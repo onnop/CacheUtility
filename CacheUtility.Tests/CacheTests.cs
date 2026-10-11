@@ -1,3 +1,5 @@
+using System.Runtime.CompilerServices;
+
 namespace CacheUtility.Tests
 {
     public class CacheTests : IDisposable
@@ -504,6 +506,119 @@ namespace CacheUtility.Tests
             Assert.NotNull(defaultItem);
             Assert.True(defaultItem.HasSlidingExpiration, "Should have default sliding expiration");
             Assert.Equal(TimeSpan.FromMinutes(30), defaultItem.SlidingExpiration);
+        }
+
+        // -----------------------------------------------------------------
+        // TryGet
+        // -----------------------------------------------------------------
+
+        [Fact]
+        public void TryGet_ReturnsFalseWhenAbsent_AndDoesNotPopulate()
+        {
+            var success = Cache.TryGet<string>("missing", "tryGetGroup", out var value);
+            Assert.False(success);
+            Assert.Null(value);
+            // Confirm nothing got populated
+            Assert.Empty(Cache.GetAllByGroup("tryGetGroup"));
+        }
+
+        [Fact]
+        public void TryGet_ReturnsTrueWhenPresent()
+        {
+            Cache.Get("k", "tryGetGroup", () => "v");
+            var success = Cache.TryGet<string>("k", "tryGetGroup", out var value);
+            Assert.True(success);
+            Assert.Equal("v", value);
+        }
+
+        [Fact]
+        public void TryGet_MismatchedType_ReturnsFalse()
+        {
+            Cache.Get("k", "tryGetGroup", () => 42);
+            var success = Cache.TryGet<string>("k", "tryGetGroup", out var value);
+            Assert.False(success);
+            Assert.Null(value);
+        }
+
+        [Fact]
+        public void TryGet_NullArgs_Throws()
+        {
+            Assert.Throws<ArgumentNullException>(() => Cache.TryGet<string>(null, "g", out _));
+            Assert.Throws<ArgumentNullException>(() => Cache.TryGet<string>("k", null, out _));
+        }
+
+        // -----------------------------------------------------------------
+        // CacheItem<T>.RefreshLock should return the SAME object on every call,
+        //     even after construction paths that bypass field initializers.
+        // -----------------------------------------------------------------
+        [Fact]
+        public void RefreshLock_ReturnsSameObjectAcrossCalls()
+        {
+            var item = new Cache.CacheItem<string> { Item = "x" };
+            var lock1 = item.RefreshLock;
+            var lock2 = item.RefreshLock;
+            var lock3 = item.RefreshLock;
+
+            Assert.NotNull(lock1);
+            Assert.Same(lock1, lock2);
+            Assert.Same(lock2, lock3);
+        }
+
+        [Fact]
+        public void RefreshLock_RemainsStableAfterReflectiveZeroInitialization()
+        {
+            // Simulates a deserialization-style construction where field initializers do not run.
+            var item = (Cache.CacheItem<string>)RuntimeHelpers
+                .GetUninitializedObject(typeof(Cache.CacheItem<string>));
+
+            var first = item.RefreshLock;
+            var second = item.RefreshLock;
+            Assert.NotNull(first);
+            Assert.Same(first, second);
+        }
+
+        // -----------------------------------------------------------------
+        // _logger field is volatile - a smoke test that ConfigureLogging works
+        //     repeatedly without exceptions.
+        // -----------------------------------------------------------------
+        [Fact]
+        public void ConfigureLogging_CanBeCalledRepeatedly()
+        {
+            Cache.ConfigureLogging(null);
+            Cache.ConfigureLogging(null);
+            Cache.Get("k", "g", () => "v");
+        }
+
+        // -----------------------------------------------------------------
+        // Concurrent populate dedup: N threads requesting same key must invoke
+        // the populate method exactly once.
+        // -----------------------------------------------------------------
+        [Fact]
+        public void ConcurrentGet_SameKey_PopulatesExactlyOnce()
+        {
+            const string group = "concurrentGroup";
+            const string key = "shared";
+            int callCount = 0;
+
+            var barrier = new Barrier(16);
+            var tasks = new Task<string>[16];
+            for (int i = 0; i < tasks.Length; i++)
+            {
+                tasks[i] = Task.Run(() =>
+                {
+                    barrier.SignalAndWait();
+                    return Cache.Get(key, group, () =>
+                    {
+                        Interlocked.Increment(ref callCount);
+                        Thread.Sleep(50); // make the race wider
+                        return "value";
+                    });
+                });
+            }
+            Task.WaitAll(tasks);
+
+            Assert.All(tasks, t => Assert.Equal("value", t.Result));
+            Assert.Equal(1, callCount);
         }
     }
 }

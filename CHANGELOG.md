@@ -5,12 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.4.7] - 2026-10-09
+## [1.4.7] - 2026-10-11
 
 ### Added
+- **.NET 10 support.** The package now ships `lib/net9.0` and `lib/net10.0`; the test suite runs on both.
 - `Cache.Persist(cacheKey, groupName)` writes the current in-memory value of an existing entry to the persistent cache. The persistent cache was only written on populate and background refresh, so a cached object changed in place afterwards (a session, a set) was restored after a restart as it was first populated. There was no way to fix that from the caller short of `Remove` plus a new `Get`, which leaves a window in which a concurrent reader populates a fresh value.
 - `Persist` takes the entry's refresh lock, so it never interleaves with a background-refresh write-back, and deletes its own files again when a `Remove` overlapped the write, so a removed value is not resurrected from disk.
 - Tests: `PersistentCacheHardeningTests.Persist_InPlaceMutation_SurvivesRestart` (shows the restart loss without `Persist`, then the fix) and `Persist_ReturnsFalse_WhenNothingToWrite`.
+
+### Changed
+- Test classes are named after the feature they cover: `NewApiTests` and `BugFixTests` are split over `GetAsyncTests`, `GroupTests`, `CacheTests` and `PersistentCacheHardeningTests`. No test was dropped.
+- Releases can only be published by the repository owner: one route (a push to `production`), an owner-only job in a protected `nuget` environment that holds the API key, and a ruleset on `production`.
 
 ### Notes
 - 100% backward compatible. One new public method; no existing behaviour changes.

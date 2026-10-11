@@ -3,7 +3,7 @@
 [![NuGet Version](https://img.shields.io/nuget/v/CacheUtility.svg)](https://www.nuget.org/packages/CacheUtility/)
 [![NuGet Downloads](https://img.shields.io/nuget/dt/CacheUtility.svg)](https://www.nuget.org/packages/CacheUtility/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE.txt)
-[![.NET](https://img.shields.io/badge/.NET-9.0-blue.svg)](https://dotnet.microsoft.com/)
+[![.NET](https://img.shields.io/badge/.NET-9.0%20%7C%2010.0-blue.svg)](https://dotnet.microsoft.com/)
 
 A thread-safe, generic wrapper for System.Runtime.Caching that simplifies cache access and supports powerful caching patterns with persistent storage capabilities.
 

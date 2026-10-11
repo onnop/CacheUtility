@@ -229,5 +229,46 @@ namespace CacheUtility.Tests
             Assert.True(stats.TotalSizeBytes > 0);
             Assert.Equal(0, stats.OrphanedFiles);
         }
+
+        // -----------------------------------------------------------------
+        // Persistent sliding expiration: LastAccessTime must be touched on read,
+        //     so that an item read within its sliding window keeps living.
+        // -----------------------------------------------------------------
+        [Fact]
+        public void PersistentSlidingExpiration_TouchedOnRead_DoesNotExpire()
+        {
+            var tempDir = Path.Combine(Path.GetTempPath(), "CacheUtilityTest_" + Guid.NewGuid().ToString("N")[..8]);
+            const string group = "slidingTouchGroup";
+            var options = new PersistentCacheOptions
+            {
+                BaseDirectory = tempDir,
+                PersistentGroups = new[] { group }
+            };
+
+            try
+            {
+                Cache.EnablePersistentCache(options);
+
+                Cache.Get("k", group, TimeSpan.FromSeconds(3), () => "original");
+                Cache.RemoveAllFromMemoryOnly();
+
+                // Read inside sliding window -> touches LastAccessTime
+                Thread.Sleep(2000);
+                var firstReload = Cache.Get("k", group, TimeSpan.FromSeconds(3), () => "should-not-be-called-1");
+                Assert.Equal("original", firstReload);
+
+                Cache.RemoveAllFromMemoryOnly();
+
+                // Another read inside the (touched) sliding window must still find it.
+                Thread.Sleep(2000);
+                var secondReload = Cache.Get("k", group, TimeSpan.FromSeconds(3), () => "should-not-be-called-2");
+                Assert.Equal("original", secondReload);
+            }
+            finally
+            {
+                Cache.DisablePersistentCache();
+                if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
+            }
+        }
     }
 }

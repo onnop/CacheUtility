@@ -1,19 +1,26 @@
 name: Deploy NuGet Package
 
+# The only release route is a push to production (a merge from master). There is no tag
+# trigger: the workflow creates the vX.Y.Z tag itself. Only onnop may release:
+#  - the job only runs when onnop pushed (or re-ran) it,
+#  - it runs in the "nuget" environment, which accepts only the production branch and
+#    requires onnop's approval,
+#  - NUGET_API_KEY is an environment secret of "nuget", so no other workflow or branch can read it,
+#  - a repository ruleset lets only admins update production.
 on:
-  workflow_dispatch:  # Enables manual trigger
+  workflow_dispatch:  # Re-run a release by hand; still gated by the environment below.
   push:
     branches:
-      - production  # Triggers when changes land on the production branch (e.g. via merge)
-    tags:
-      - 'v*'  # Triggers on version tags like v1.0.0
+      - production
 
 permissions:
   contents: write  # Needed so the "Tag release" step below can push a tag with the default token.
 
 jobs:
   build-and-publish:
+    if: github.actor == 'onnop' && github.ref == 'refs/heads/production'
     runs-on: windows-latest
+    environment: nuget
 
     steps:
       - name: Checkout code
@@ -22,7 +29,9 @@ jobs:
       - name: Setup .NET SDK
         uses: actions/setup-dotnet@v5
         with:
-          dotnet-version: '9.0.x'  # Matches <TargetFramework>net9.0</TargetFramework>
+          dotnet-version: |
+            9.0.x
+            10.0.x
 
       - name: Restore dependencies
         run: dotnet restore
@@ -42,12 +51,8 @@ jobs:
         run: dotnet nuget push ./nupkg/*.nupkg --api-key ${{ secrets.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
 
       - name: Tag release
-        # Only when this run is a direct push to production - not for a tag push (would tag itself
-        # again) and not for a manual workflow_dispatch (which may target any branch). The version
-        # is read from the csproj rather than invented here, so bumping it is still a normal part of
-        # the change you merge; this step just turns "merged into production" into the release tag,
-        # instead of that being a separate manual `git tag` + `git push` step afterwards.
-        if: github.ref == 'refs/heads/production'
+        # The version is read from the csproj, so bumping it is a normal part of the change you
+        # merge; this step turns "merged into production" into the vX.Y.Z release tag.
         shell: pwsh
         run: |
           $version = (Select-String -Path CacheUtility.csproj -Pattern '<Version>(.*?)</Version>').Matches[0].Groups[1].Value

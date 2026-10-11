@@ -57,7 +57,7 @@ When adding new methods to the `Cache` class:
 3. For new state, prefer `ConcurrentDictionary` over `Dictionary` + manual locking. There is no global cache lock; the only locks are `_persistentLifecycleLock` (enable/disable persistence) and the per-item `CacheItem<T>.RefreshLock`.
 4. For populate de-duplication, follow the existing `_inflightSync` (`Lazy<object>`) and `_inflightAsync` (`Task<object>`) patterns. Never invoke a user populate callback while holding a lock.
 5. Keep public signatures backward-compatible. Soft-deprecate via `<remarks>` (with `<see cref>` to the preferred replacement) rather than `[Obsolete]` whenever possible.
-6. Add xUnit tests in `CacheUtility.Tests/` (see [NewApiTests.cs](mdc:CacheUtility.Tests/NewApiTests.cs) for the established style).
+6. Add xUnit tests in `CacheUtility.Tests/` (see [GetAsyncTests.cs](mdc:CacheUtility.Tests/GetAsyncTests.cs) for the established style).
 
 ### Cache Group Internals
 When working with groups inside `Cache.cs`:
