@@ -1,6 +1,6 @@
 ---
-description: 
-globs: 
+description: CacheUtility build and test commands, release process (merge into production publishes to NuGet), debugging tips, and which docs to keep in sync
+globs: CacheUtility.csproj,CHANGELOG.md,README.md,.github/workflows/*.yml
 alwaysApply: false
 ---
 # CacheUtility Development Workflow
@@ -86,7 +86,7 @@ Update [CacheUtility.csproj](mdc:CacheUtility.csproj) for every release:
    - `License.txt` and the readme are still referenced in the `.csproj` `<None>` items.
 
 ### NuGet Package Publishing
-The published flow is automated via [main.yml](mdc:.github/workflows/main.yml) — pushing a `vX.Y.Z` tag triggers build + pack + push to nuget.org using the `NUGET_API_KEY` secret. Manual fallback:
+Publishing is automated via [main.yml](mdc:.github/workflows/main.yml). Merging (or pushing) into the `production` branch runs build, test, pack and push to nuget.org using the `NUGET_API_KEY` secret, then tags the commit `vX.Y.Z` from the csproj `<Version>`. Bump the version in the change you merge: without a bump the push is skipped as a duplicate and no tag is created. Pushing a `v*` tag by hand or running the workflow manually also publishes. Manual fallback:
 ```bash
 dotnet pack --configuration Release --output ./nupkg
 dotnet nuget push ./nupkg/*.nupkg --source https://api.nuget.org/v3/index.json --api-key YOUR_API_KEY
@@ -98,13 +98,13 @@ dotnet nuget push ./nupkg/*.nupkg --source https://api.nuget.org/v3/index.json -
 1. **Single responsibility**: each method does one thing.
 2. **Backward compatibility**: never break an existing public signature. Soft-deprecate with `<remarks>` + `<see cref>` to the preferred replacement.
 3. **Performance**: keep the hot path (`Get` / `GetAsync` / `TryGet`) lock-free and reflection-free.
-4. **Thread safety**: use `ConcurrentDictionary` / `Lazy<T>` / shared `Task<T>` for new shared state. Reach for `lock (CacheLock)` only when the operation must be globally serialized.
+4. **Thread safety**: use `ConcurrentDictionary` / `Lazy<T>` / shared `Task<T>` for new shared state. There is no global lock; per-item work goes under `CacheItem<T>.RefreshLock`.
 
 ### Git Workflow
 1. Create feature branches off `master` for non-trivial work.
 2. Land tests and the implementation in the same PR.
 3. Keep commits focused; prefer small, well-described commits over one giant squash.
-4. Tag releases as `vX.Y.Z` to trigger the publish workflow.
+4. Merge `master` into `production` to release; the workflow creates the `vX.Y.Z` tag. Do not tag by hand.
 
 ### Performance Testing
 For changes that could affect the hot path:
@@ -116,11 +116,12 @@ For changes that could affect the hot path:
 ## Debugging Guidelines
 
 ### Common Issues
-1. **Thread deadlocks**: Almost always caused by invoking a user populate callback while holding `CacheLock`. The current code goes out of its way to avoid this — keep it that way.
-2. **Stale cached values**: Check the `refresh` interval and the auto-refresh background task; verify the populate method isn't throwing and being silently swallowed.
-3. **Cache misses where you expect a hit**: Verify the group + key combination produces the same internal key (`groupName_cacheKey`).
-4. **Persistent cache not loading on restart**: Confirm `EnablePersistentCache(...)` is called *before* the first `Get`, and that the directory permissions allow read/write.
-5. **Dependency cascade not firing**: Confirm `SetDependencies(parent, children...)` is called *before* `RemoveGroup(parent)`, and remember `SetDependencies` *replaces* the dependency list.
+1. **Thread deadlocks**: Almost always caused by invoking a user populate callback while holding a lock, or by sync-over-async (`Cache.Get` with a Task-returning populate under a single-threaded `SynchronizationContext`; use `GetAsync`). The current code goes out of its way to avoid both - keep it that way.
+2. **Persisted value is stale after a restart**: the object was changed in place after it was cached and nobody called `Cache.Persist(key, group)`.
+3. **Stale cached values**: Check the `refresh` interval and the auto-refresh background task; verify the populate method isn't throwing and being silently swallowed.
+4. **Cache misses where you expect a hit**: Verify the group + key combination produces the same internal key (`groupName_cacheKey`).
+5. **Persistent cache not loading on restart**: Confirm `EnablePersistentCache(...)` is called *before* the first `Get`, and that the directory permissions allow read/write.
+6. **Dependency cascade not firing**: Confirm `SetDependencies(parent, children...)` is called *before* `RemoveGroup(parent)`, and remember `SetDependencies` *replaces* the dependency list.
 
 ### Debugging Tools
 - Enable logging: `services.AddCacheLogging()` (DI) or `Cache.ConfigureLogging(loggerFactory)` (non-DI), then set the `CacheUtility` source to `Debug` or `Trace`.

@@ -1,6 +1,6 @@
 ---
-description: 
-globs: 
+description: CacheUtility public API shape, internal key and group model, persistence write points, and how to extend or test the Cache class
+globs: Cache.cs,CacheServiceExtensions.cs,CacheUtility.Tests/**/*.cs
 alwaysApply: false
 ---
 # CacheUtility API Patterns
@@ -11,7 +11,8 @@ alwaysApply: false
 The `Cache` class combines the group name and the user-provided key into a single internal key:
 ```csharp
 // In Cache.cs
-cacheKey = string.Format("{0}_{1}", groupName, cacheKey);
+private static string BuildFullKey(string groupName, string cacheKey) =>
+    string.Concat(groupName, "_", cacheKey);
 ```
 This combined key is what `MemoryCache.Default` actually sees. The original (un-prefixed) key is preserved on `CacheItem<T>.CacheKey` for metadata and group enumeration.
 
@@ -24,23 +25,28 @@ Synchronous (`Get<TData>`):
 3. Absolute: `Get<TData>(key, group, absoluteExpiration, populateMethod, refresh = default)`
 4. Full control: `Get<TData>(key, group, absoluteExpiration, slidingExpiration, priority, populateMethod, removedCallback = null, refresh = default)`
 
-Asynchronous (`GetAsync<TData>` — added in 1.4.0):
+Asynchronous (`GetAsync<TData>` - added in 1.4.0):
 - Same four shapes as above, but `populateMethod` is `Func<Task<TData>>` and each overload accepts a trailing `CancellationToken cancellationToken = default`.
 
 ### Populate Method Pattern
-- Sync populate: `Func<TData>` — invoked at most once per cache miss; concurrent callers wait on a shared `Lazy<object>`.
-- Async populate: `Func<Task<TData>>` — invoked at most once per cache miss; concurrent callers await the same `Task<object>`.
+- Sync populate: `Func<TData>` - invoked at most once per cache miss; concurrent callers wait on a shared `Lazy<object>`.
+- Async populate: `Func<Task<TData>>` - invoked at most once per cache miss; concurrent callers await the same `Task<object>`.
 - A failed populate (exception / faulted task) is **not** cached. The next call retries.
 - Cancellation on `GetAsync` only cancels the awaiting caller. Other waiters on the same in-flight populate continue to await the shared task.
 
 ### Group-Based Operations
-- Items are organized by group name. Group membership lives in `_groups` (a `ConcurrentDictionary<string, ConcurrentDictionary<string, byte>>`).
+- Items are organized by group name. Group membership lives in `_groups` (a `ConcurrentDictionary<string, CacheGroup>`). A `CacheGroup` holds the key set plus a sweep generation; it is never swapped out by `RemoveGroup`, which bumps the generation and drains the group in place (1.4.6).
 - `GetAllByGroup` returns a `Dictionary<string, object>`; `GetAllByGroup<TData>` returns `Dictionary<string, TData>` and silently skips items whose stored type does not match `TData`.
-- `RemoveGroup(params string[])` removes all items in the listed groups *and* their dependents. It is **cycle-safe** — a dependency cycle (`A → B → A`) will not infinite-loop.
+- `RemoveGroup(params string[])` removes all items in the listed groups *and* their dependents. It is **cycle-safe** - a dependency cycle (`A → B → A`) will not infinite-loop.
 - `SetDependencies(group, params dependents)` replaces (not appends to) the dependency list for `group`.
 
 ### Peek Pattern
 - `TryGet<TData>(key, group, out value)` checks the in-memory cache only. It does **not** consult persistent storage and does **not** invoke any populate method. Returns `false` if missing or if the stored type is not assignable to `TData`.
+
+### Persistence Write Points
+- An entry in a persistent group is written to disk on populate and on every background refresh, never on read.
+- A cached reference type changed in place afterwards is only changed in memory. Callers call `Cache.Persist(key, group)` (1.4.7) after such a change. It writes under the entry's `RefreshLock` and returns `false` when persistence is off, the group is not persistent, the key is not in memory, or the write failed.
+- Any new write path must use the same guards: skip the write when a removal overlapped it (`RemovalOverlappedAdd`, or the entry is no longer the `MemoryCache` resident), so a removed value is never resurrected from disk.
 
 ## Extension Guidelines
 
@@ -48,21 +54,21 @@ Asynchronous (`GetAsync<TData>` — added in 1.4.0):
 When adding new methods to the `Cache` class:
 1. Validate parameters at the entry point (`ArgumentNullException` for nulls, `nameof(...)` for parameter names).
 2. Use the established internal key combination (`groupName_cacheKey`).
-3. For new state, prefer `ConcurrentDictionary` over `Dictionary` + manual locking. Reach for `CacheLock` only when an operation must be globally serialized.
-4. For populate de-duplication, follow the existing `_inflightSync` (`Lazy<object>`) and `_inflightAsync` (`Task<object>`) patterns — never invoke a user populate callback while holding `CacheLock`.
+3. For new state, prefer `ConcurrentDictionary` over `Dictionary` + manual locking. There is no global cache lock; the only locks are `_persistentLifecycleLock` (enable/disable persistence) and the per-item `CacheItem<T>.RefreshLock`.
+4. For populate de-duplication, follow the existing `_inflightSync` (`Lazy<object>`) and `_inflightAsync` (`Task<object>`) patterns. Never invoke a user populate callback while holding a lock.
 5. Keep public signatures backward-compatible. Soft-deprecate via `<remarks>` (with `<see cref>` to the preferred replacement) rather than `[Obsolete]` whenever possible.
 6. Add xUnit tests in `CacheUtility.Tests/` (see [NewApiTests.cs](mdc:CacheUtility.Tests/NewApiTests.cs) for the established style).
 
 ### Cache Group Internals
 When working with groups inside `Cache.cs`:
-- Always update `_groups[groupName]` when registering or removing a key.
+- Always update the group's key set when registering or removing a key. Remove the value from `MemoryCache` before dropping the registration, never the other way round, and sample the group's sweep token before a populate runs (see `CaptureSweepToken` / `RemovalOverlappedAdd`).
 - Use `_dependencies` (a `ConcurrentDictionary<string, string[]>`) for cascade-on-remove relationships. Remember `RemoveGroup` already handles cycle detection.
-- `RemoveByInternalKey(fullKey, knownGroup = null)` is the one canonical removal helper — call it instead of duplicating cleanup logic for in-flight populate state, group membership, and persistent files.
+- `RemoveByInternalKey(fullKey, knownGroup = null)` is the one canonical removal helper - call it instead of duplicating cleanup logic for in-flight populate state, group membership, and persistent files.
 
 ### Data Type Handling
 - Values are wrapped in `Cache.CacheItem<TData>` (which implements internal `ICacheItem`).
 - Reflection is **not** used on hot paths. Anything you need from a `CacheItem<T>` of unknown `T` should be reachable via the `ICacheItem` interface (extend it if needed).
-- For persistent cache, values must be JSON-serializable via `System.Text.Json`. Strings and `byte[]` use a fast path that bypasses the serializer.
+- For persistent cache, values must be JSON-serializable via `System.Text.Json` (`CacheJsonOptions`). Every value goes through the serializer; after a reload, `object`-typed members come back as `JsonElement`.
 
 ## Testing Patterns
 
@@ -91,7 +97,8 @@ public class FeatureTests : IDisposable
 - Concurrent populate (verify the populate method is invoked exactly once under N parallel callers).
 - Edge cases: null parameters, empty groups, type mismatches in `GetAllByGroup<T>` / `TryGet<T>`.
 - Expiration: absolute, sliding, and the `MaxSlidingExpiration` clamp.
-- Persistent cache: round-trip, atomic writes (no half-written files on simulated crash), orphaned `.cache` cleanup, group whitelist, sliding-touch throttle.
+- Persistent cache: round-trip, atomic writes (no half-written files on simulated crash), orphaned `.cache` cleanup, group whitelist, sliding-touch throttle, in-place change plus `Persist` surviving a simulated restart (`Cache.RemoveAllFromMemoryOnly()`).
+- Group removal races: populate or refresh overlapping `RemoveGroup` (see `GroupRemovalRaceTests.cs`).
 - Dependency cascades, including cycles.
 - Background refresh: non-blocking, error-resilient, deduped.
 
@@ -111,6 +118,7 @@ The `Cache` class wraps `MemoryCache.Default`:
 ### Documentation Updates
 When adding features, update:
 - XML doc comments on the new public surface (`<summary>`, `<param>`, `<returns>`, `<remarks>` where useful).
-- [README.md](mdc:README.md) — feature list, usage section, API reference table.
-- [CHANGELOG.md](mdc:CHANGELOG.md) — a new entry under the next version.
+- [README.md](mdc:README.md) - feature list, usage section, API reference table.
+- [CHANGELOG.md](mdc:CHANGELOG.md) - a new entry under the next version.
 - `<Version>` and `<PackageReleaseNotes>` in [CacheUtility.csproj](mdc:CacheUtility.csproj).
+- These rules, when the public API, locking model or release flow changes.

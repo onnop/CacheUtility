@@ -1,6 +1,6 @@
 ---
-description: 
-globs: 
+description: CacheUtility C# style, thread-safety model, test organization, and release metadata rules
+globs: **/*.cs,CacheUtility.csproj
 alwaysApply: false
 ---
 # CacheUtility Coding Standards
@@ -9,9 +9,8 @@ alwaysApply: false
 
 ### Naming Conventions
 Follow the patterns established in [Cache.cs](mdc:Cache.cs):
-- Private static fields use camelCase with an underscore prefix: `_dependencies`, `_groups`, `_inflightSync`, `_inflightAsync`, `_logger`, `_persistentOptions`.
-- Globally-shared lock objects use PascalCase: `CacheLock`.
-- Public methods use PascalCase: `Get`, `GetAsync`, `Remove`, `RemoveGroup`, `TryGet`, `GetAllByGroup`.
+- Private static fields use camelCase with an underscore prefix: `_dependencies`, `_groups`, `_inflightSync`, `_inflightAsync`, `_logger`, `_persistentOptions`, `_persistentLifecycleLock`.
+- Public methods use PascalCase: `Get`, `GetAsync`, `Remove`, `RemoveGroup`, `TryGet`, `GetAllByGroup`, `Persist`.
 - Generic type parameters use the `T` prefix; the data type parameter is `TData`.
 - Parameters use camelCase: `cacheKey`, `groupName`, `populateMethod`, `cancellationToken`.
 
@@ -27,13 +26,14 @@ Follow the patterns established in [Cache.cs](mdc:Cache.cs):
 
 ### Thread Safety
 - All operations must be thread-safe. The current concurrency model is:
-  - `ConcurrentDictionary<string, ...>` for `_groups`, `_dependencies`, `_inflightSync`, `_inflightAsync` — lock-free reads.
+  - `ConcurrentDictionary<string, ...>` for `_groups`, `_dependencies`, `_inflightSync`, `_inflightAsync` - lock-free reads.
   - `Lazy<object>` for synchronous populate de-duplication (one populate run, N waiters).
   - Shared `Task<object>` for asynchronous populate de-duplication.
-  - A single global `lock (CacheLock)` for operations that must be globally serialized: enabling/disabling persistent cache, bulk removes, dependency cycle resolution.
-  - Per-item refresh locks via `LazyInitializer.EnsureInitialized` on `Cache.CacheItem<T>.RefreshLock`.
-- Never invoke a user-supplied populate callback while holding `CacheLock` — that is how reentrancy deadlocks happen.
-- Do not reintroduce `ReaderWriterLockSlim` — it was removed in v1.4.0 in favor of the model above.
+  - Per-group sweep generation (`CacheGroup`) so a `RemoveGroup` that overlaps a populate or refresh always wins, without a global lock.
+  - `lock (_persistentLifecycleLock)` only for enabling/disabling persistent cache.
+  - Per-item `lock (cacheItem.RefreshLock)` (lazily created via `LazyInitializer.EnsureInitialized`) around refresh state and every persistent write of that item (refresh write-back, `Persist`).
+- Never invoke a user-supplied populate callback while holding a lock - that is how reentrancy deadlocks happen.
+- Do not reintroduce `ReaderWriterLockSlim` - it was removed in v1.4.0 in favor of the model above.
 
 ### Generic Methods
 - Use `TData` for the data type parameter; do not constrain it unless the new method genuinely requires a constraint.
@@ -61,5 +61,5 @@ When releasing a new version:
 - Avoid reflection on hot paths. The internal `ICacheItem` interface exists precisely so metadata enumeration and size estimation don't need `MakeGenericType` / `Activator.CreateInstance` / `MethodInfo.Invoke`.
 - Cache derived values on `CacheItem<T>` rather than recomputing them (e.g. `CachedEstimatedSize` after the first `RecomputeEstimatedSize()` call).
 - For persistent cache writes, use the `WriteFileAtomic(path, content)` helper (`.tmp` + `File.Move`). Never write directly to the final `.cache` path.
-- Throttle sliding-expiration "touch" writes to persistent storage (currently min 1 minute between touches per item).
+- Throttle sliding-expiration "touch" writes to persistent storage (currently one touch per 10% of the item's sliding window, at least 1 second apart).
 - When in doubt, micro-benchmark before and after using `BenchmarkDotNet`.
