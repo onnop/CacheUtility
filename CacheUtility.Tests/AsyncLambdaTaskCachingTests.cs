@@ -74,7 +74,7 @@ namespace CacheUtility.Tests
         }
 
         /// <summary>
-        /// Call the same key twice in a row — second call should hit the memory cache
+        /// Call the same key twice in a row - second call should hit the memory cache
         /// rather than re-running the factory, and must not hang.
         /// </summary>
         [Fact(Timeout = 15_000)]
@@ -107,7 +107,7 @@ namespace CacheUtility.Tests
         }
 
         /// <summary>
-        /// Concurrent callers for the same outer key — must all resolve, none hang.
+        /// Concurrent callers for the same outer key - must all resolve, none hang.
         /// Exercises _inflightSync single-flight with async lambdas.
         /// </summary>
         [Fact(Timeout = 15_000)]

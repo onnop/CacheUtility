@@ -13,7 +13,7 @@ namespace CacheUtility
     {
         /// <summary>
         /// Registers CacheUtility logging with the application's <see cref="ILoggerFactory"/>.
-        /// Logging is wired automatically on host startup — no manual <c>Cache.ConfigureLogging()</c> call needed.
+        /// Logging is wired automatically on host startup - no manual <c>Cache.ConfigureLogging()</c> call needed.
         /// </summary>
         /// <example>
         /// <code>

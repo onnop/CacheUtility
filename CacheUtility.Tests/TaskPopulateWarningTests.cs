@@ -92,7 +92,7 @@ namespace CacheUtility.Tests
                 m.Level == LogLevel.Warning && m.Message.Contains("Task-returning populate")));
         }
 
-        // Two distinct call sites — each is a different compiler-generated async state machine
+        // Two distinct call sites - each is a different compiler-generated async state machine
         // enclosed in a different method, so their populate site keys differ.
         private static async Task<List<int>> FirstCallSite()
         {
