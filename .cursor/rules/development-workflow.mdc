@@ -8,7 +8,7 @@ alwaysApply: false
 ## Building the Project
 
 ### Prerequisites
-- .NET 9.0 SDK
+- .NET 10 SDK (builds and tests both net9.0 and net10.0; the .NET 9 runtime is needed to run the net9.0 tests)
 - Visual Studio 2022, JetBrains Rider, or VS Code with the C# Dev Kit
 - (Optional) NuGet CLI for local package experimentation
 
@@ -39,10 +39,10 @@ dotnet test
 dotnet test --logger "console;verbosity=detailed"
 
 # Run a single test class
-dotnet test --filter "FullyQualifiedName~NewApiTests"
+dotnet test --filter "FullyQualifiedName~GetAsyncTests"
 
 # Run a single test method
-dotnet test --filter "FullyQualifiedName~NewApiTests.GetAsync_PopulatesValueOnce"
+dotnet test --filter "FullyQualifiedName~GetAsyncTests.GetAsync_PopulatesValueOnce"
 ```
 
 > The test assembly disables xUnit parallelization via [TestCollectionConfig.cs](mdc:CacheUtility.Tests/TestCollectionConfig.cs); tests run sequentially because the `Cache` class is static.
@@ -51,9 +51,9 @@ dotnet test --filter "FullyQualifiedName~NewApiTests.GetAsync_PopulatesValueOnce
 1. **Functional**: Core cache operations work for sync and async populate methods.
 2. **Edge cases**: Null arguments, empty groups, type mismatches in `TryGet<T>` / `GetAllByGroup<T>`.
 3. **Data type variety**: Strings, ints, custom POCOs, collections, nullables.
-4. **Concurrency**: A single populate invocation under N concurrent callers (see [NewApiTests.cs](mdc:CacheUtility.Tests/NewApiTests.cs)).
+4. **Concurrency**: A single populate invocation under N concurrent callers (see [GetAsyncTests.cs](mdc:CacheUtility.Tests/GetAsyncTests.cs)).
 5. **Persistent cache**: Round-trip, atomic writes, orphaned-file cleanup, sliding-touch throttle, group whitelist (see [PersistentCacheHardeningTests.cs](mdc:CacheUtility.Tests/PersistentCacheHardeningTests.cs)).
-6. **Bug-fix regressions**: Anything previously broken should land alongside a regression test in [BugFixTests.cs](mdc:CacheUtility.Tests/BugFixTests.cs).
+6. **Bug-fix regressions**: Anything previously broken should land alongside a regression test in the test class for the feature it touches.
 7. **Cleanup**: `Cache.RemoveAll()` and `Cache.DisablePersistentCache()` in both setup and `Dispose`.
 
 ### Adding New Tests
@@ -86,7 +86,7 @@ Update [CacheUtility.csproj](mdc:CacheUtility.csproj) for every release:
    - `License.txt` and the readme are still referenced in the `.csproj` `<None>` items.
 
 ### NuGet Package Publishing
-Publishing is automated via [main.yml](mdc:.github/workflows/main.yml). Merging (or pushing) into the `production` branch runs build, test, pack and push to nuget.org using the `NUGET_API_KEY` secret, then tags the commit `vX.Y.Z` from the csproj `<Version>`. Bump the version in the change you merge: without a bump the push is skipped as a duplicate and no tag is created. Pushing a `v*` tag by hand or running the workflow manually also publishes. Manual fallback:
+Publishing is automated via [main.yml](mdc:.github/workflows/main.yml). Merging (or pushing) into the `production` branch runs build, test, pack and push to nuget.org using the `NUGET_API_KEY` secret, then tags the commit `vX.Y.Z` from the csproj `<Version>`. Bump the version in the change you merge: without a bump the push is skipped as a duplicate and no tag is created. Only the repository owner (`onnop`) can release: the job runs only for that actor, in the `nuget` environment (production branch only, owner approval required, holds the `NUGET_API_KEY` secret), and a ruleset lets only admins update `production`. Pushing a tag does not publish. Manual fallback:
 ```bash
 dotnet pack --configuration Release --output ./nupkg
 dotnet nuget push ./nupkg/*.nupkg --source https://api.nuget.org/v3/index.json --api-key YOUR_API_KEY

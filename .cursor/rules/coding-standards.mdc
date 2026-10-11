@@ -45,7 +45,7 @@ Follow the patterns established in [Cache.cs](mdc:Cache.cs):
 - Tests live in [CacheUtility.Tests/](mdc:CacheUtility.Tests).
 - The test assembly disables xUnit parallelization via [TestCollectionConfig.cs](mdc:CacheUtility.Tests/TestCollectionConfig.cs); do not re-enable it without first making `Cache` non-static.
 - Each test class implements `IDisposable` and calls `Cache.RemoveAll()` (and `Cache.DisablePersistentCache()` if it touched persistence) in both the constructor and `Dispose`.
-- Prefer narrow, scenario-named files (`BugFixTests.cs`, `NewApiTests.cs`, `PersistentCacheHardeningTests.cs`) over piling everything into [CacheTests.cs](mdc:CacheUtility.Tests/CacheTests.cs).
+- Prefer narrow, scenario-named files (`GetAsyncTests.cs`, `GroupTests.cs`, `PersistentCacheHardeningTests.cs`), named after the feature they cover, never after when or why they were written (no `BugFixTests`, `NewApiTests`, phase numbers), over piling everything into [CacheTests.cs](mdc:CacheUtility.Tests/CacheTests.cs).
 - Follow Arrange-Act-Assert.
 
 ### NuGet Package Configuration

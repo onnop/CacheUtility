@@ -29,17 +29,17 @@ CacheUtility is a thread-safe, generic wrapper for `System.Runtime.Caching` that
 
 ### Test Project
 - [CacheUtility.Tests/](mdc:CacheUtility.Tests) - xUnit test project
-- [CacheTests.cs](mdc:CacheUtility.Tests/CacheTests.cs) - Original feature tests (Get, RemoveGroup, persistent cache, metadata)
-- [BugFixTests.cs](mdc:CacheUtility.Tests/BugFixTests.cs) - Phase 1 correctness regressions (RefreshLock, sliding LastAccess, dependency cycles, etc.)
-- [NewApiTests.cs](mdc:CacheUtility.Tests/NewApiTests.cs) - Coverage for `GetAsync`, `GetAllByGroup<T>`, `TryGet<T>`
-- [PersistentCacheHardeningTests.cs](mdc:CacheUtility.Tests/PersistentCacheHardeningTests.cs) - Atomic writes, orphan cleanup, sliding-touch throttle, `Persist` across a simulated restart
+- [CacheTests.cs](mdc:CacheUtility.Tests/CacheTests.cs) - Core sync API: `Get`, `TryGet<T>`, removal, expiration, single-flight populate, `RefreshLock`, logging setup, metadata
+- [GetAsyncTests.cs](mdc:CacheUtility.Tests/GetAsyncTests.cs) - `GetAsync`: single-flight, failure retry, cancellation, expiration, background refresh
+- [GroupTests.cs](mdc:CacheUtility.Tests/GroupTests.cs) - `GetAllByGroup<T>`, group bookkeeping after eviction, `SetDependencies` and dependency cycles
+- [PersistentCacheHardeningTests.cs](mdc:CacheUtility.Tests/PersistentCacheHardeningTests.cs) - Atomic writes, orphan cleanup, sliding touch on read and its throttle, `Persist` across a simulated restart
 - [GroupRemovalRaceTests.cs](mdc:CacheUtility.Tests/GroupRemovalRaceTests.cs) - `RemoveGroup` racing populates and background refreshes (1.4.6)
 - [AsyncLambdaTaskCachingTests.cs](mdc:CacheUtility.Tests/AsyncLambdaTaskCachingTests.cs) / [TaskPopulateWarningTests.cs](mdc:CacheUtility.Tests/TaskPopulateWarningTests.cs) - Task-returning populates on the sync `Get` (1.4.1 deadlock fix and its warning)
 - [EvictionLoggingTests.cs](mdc:CacheUtility.Tests/EvictionLoggingTests.cs) - Eviction diagnostics
 - [TestCollectionConfig.cs](mdc:CacheUtility.Tests/TestCollectionConfig.cs) - Disables xUnit parallelization (the `Cache` class is static)
 
 ### Build & Packaging
-- Target framework: .NET 9.0
+- Target frameworks: net9.0 and net10.0 (`<TargetFrameworks>` in the csproj; tests run on both)
 - Dependencies: `System.Runtime.Caching`, `Microsoft.Extensions.Logging.Abstractions`, `Microsoft.Extensions.Hosting.Abstractions`, `System.Text.Json`
 - Configured for NuGet package generation on build (`GeneratePackageOnBuild`)
 - Current version: see `<Version>` in [CacheUtility.csproj](mdc:CacheUtility.csproj)

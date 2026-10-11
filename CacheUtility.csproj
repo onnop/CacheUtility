@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net9.0</TargetFramework>
+    <TargetFrameworks>net9.0;net10.0</TargetFrameworks>
     <GeneratePackageOnBuild>True</GeneratePackageOnBuild>
     <Version>1.4.7</Version>
     <Title>Thread-Safe .NET Memory Cache with Groups, Dependencies, Auto-Population &amp; Persistent Storage</Title>
@@ -27,7 +27,7 @@ Perfect for high-performance applications requiring sophisticated caching patter
     <PackageProjectUrl>https://www.athenaict.com/NuGet/Cache</PackageProjectUrl>
     <PackageIcon>Logo_initials.png</PackageIcon>
     <PackageTags>cache;caching;memory-cache;persistent-cache;thread-safe;cache-groups;cache-dependencies;auto-population;performance;dotnet;system-runtime-caching;cache-management;high-performance;scalability;cache-utility;bulk-retrieval;monitoring;metadata;statistics;disk-storage;json-serialization;auto-refresh;cache-monitoring;</PackageTags>
-    <PackageReleaseNotes>v1.4.7: New `Cache.Persist(cacheKey, groupName)` writes the current in-memory value of an existing entry to the persistent cache. The persistent cache was only written on populate and background refresh, so a cached object changed in place afterwards (a session, a set) came back after a restart as it was first populated, and the only workaround (`Remove` plus a new `Get`) opened a window in which a concurrent reader populated a fresh value. `Persist` writes under the entry's refresh lock, so it never interleaves with a background-refresh write-back, and deletes its own files again when a `Remove` overlapped the write. Returns false when persistence is off, the group is not persistent, the key is not in memory, or the write failed. 100% backward compatible; one new public method.
+    <PackageReleaseNotes>v1.4.7: Adds .NET 10 support (the package ships net9.0 and net10.0). New `Cache.Persist(cacheKey, groupName)` writes the current in-memory value of an existing entry to the persistent cache. The persistent cache was only written on populate and background refresh, so a cached object changed in place afterwards (a session, a set) came back after a restart as it was first populated, and the only workaround (`Remove` plus a new `Get`) opened a window in which a concurrent reader populated a fresh value. `Persist` writes under the entry's refresh lock, so it never interleaves with a background-refresh write-back, and deletes its own files again when a `Remove` overlapped the write. Returns false when persistence is off, the group is not persistent, the key is not in memory, or the write failed. 100% backward compatible; one new public method.
 
 v1.4.6: Fixfor a group-bookkeeping race that could permanently orphan cache entries. `RemoveGroup` detached the whole group from the internal group map and then swept a snapshot of its keys, while an add registered its key in the group *before* writing the value to `MemoryCache`. A populate that straddled a concurrent `RemoveGroup` therefore landed its value in `MemoryCache` after the sweep had already passed, registered in a group object no longer reachable from the group map. The entry stayed live but invisible: no later `RemoveGroup` could evict it, and it served stale reads until its own TTL expired. Multi-user apps that invalidate a group on every write (while other requests populate the same group) hit this constantly - a measured 35% of entries were orphaned under a 4-thread invalidation load. The fix makes removal and addition agree on one source of truth: `RemoveGroup` now drains the group in place instead of detaching it, bumping a per-group sweep generation first; populates sample that generation before they run and roll their own entry back if it moved, so a concurrent invalidation always wins - even one issued while the populate was still reading its source data; single-key removal drops the value before the registration, so a sweep can never skip a key whose value is still live; and the background-refresh write-back is guarded the same way, so a refresh can no longer resurrect the persistent file a concurrent `RemoveGroup` just deleted. Five new regression tests (`GroupRemovalRaceTests`) reproduce the races deterministically - the concurrent-populate one orphaned 1,421 of 4,000 entries before the fix and zero after. 100% backward compatible; no public API changes.
 
@@ -64,27 +64,12 @@ v1.4.1: Critical fix for a deadlock introduced in 1.4.0. Synchronous Cache.Get c
     <None Remove="CacheUtility.Benchmarks\**" />
   </ItemGroup>
 
+  <!-- Include, not Update: with multiple TargetFrameworks the pack runs in the outer build,
+       which has no default None items for an Update to match. Remove first so the inner
+       builds do not list them twice. -->
   <ItemGroup>
-    <None Update="Logo_initials.png">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <Pack>True</Pack>
-      <PackagePath>\</PackagePath>
-    </None>
-    <None Update="README.md">
-      <PackagePath>\</PackagePath>
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <Pack>True</Pack>
-    </None>
-    <None Update="CHANGELOG.md">
-      <PackagePath>\</PackagePath>
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <Pack>True</Pack>
-    </None>
-    <None Update="License.txt">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <Pack>True</Pack>
-      <PackagePath>\</PackagePath>
-    </None>
+    <None Remove="Logo_initials.png;README.md;CHANGELOG.md;License.txt" />
+    <None Include="Logo_initials.png;README.md;CHANGELOG.md;License.txt" Pack="True" PackagePath="\" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>
