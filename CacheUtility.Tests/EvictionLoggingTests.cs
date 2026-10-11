@@ -76,7 +76,7 @@ namespace CacheUtility.Tests
 
             Cache.Remove(key, Group);
 
-            // The eviction-logging hook must ignore Removed (caller-initiated) reasons —
+            // The eviction-logging hook must ignore Removed (caller-initiated) reasons -
             // Cache.Remove already logs at Debug upstream. We verify no "Cache entry expired"
             // line was produced.
             Assert.DoesNotContain(_provider.Messages, m =>
