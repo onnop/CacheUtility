@@ -17,18 +17,22 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup .NET SDK
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v5
         with:
-          dotnet-version: '9.0.x'  # Or your preferred version
+          dotnet-version: '9.0.x'  # Matches <TargetFramework>net9.0</TargetFramework>
 
       - name: Restore dependencies
         run: dotnet restore
 
       - name: Build
         run: dotnet build --configuration Release --no-restore
+
+      - name: Test
+        # A red test must stop the release before anything reaches nuget.org.
+        run: dotnet test --configuration Release --no-build
 
       - name: Pack
         run: dotnet pack --configuration Release --no-build -o ./nupkg

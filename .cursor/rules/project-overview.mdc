@@ -1,7 +1,7 @@
 ---
-description: 
-globs: 
-alwaysApply: false
+description: What CacheUtility is, its file layout, test files, and the public surface of the Cache class
+globs:
+alwaysApply: true
 ---
 # CacheUtility Project Overview
 
@@ -14,7 +14,7 @@ CacheUtility is a thread-safe, generic wrapper for `System.Runtime.Caching` that
 - Cache groups with strongly-typed bulk access (`GetAllByGroup<T>`)
 - Cycle-safe dependency relationships between groups (`SetDependencies`)
 - Multiple expiration strategies (sliding / absolute) and non-blocking auto-refresh
-- Optional persistent cache to disk (atomic writes, group whitelist, background cleanup)
+- Optional persistent cache to disk (atomic writes, group whitelist, background cleanup, `Persist` for in-place changes)
 - Built-in diagnostic logging via `Microsoft.Extensions.Logging` (`AddCacheLogging()`)
 
 ## Key Project Structure
@@ -32,25 +32,30 @@ CacheUtility is a thread-safe, generic wrapper for `System.Runtime.Caching` that
 - [CacheTests.cs](mdc:CacheUtility.Tests/CacheTests.cs) - Original feature tests (Get, RemoveGroup, persistent cache, metadata)
 - [BugFixTests.cs](mdc:CacheUtility.Tests/BugFixTests.cs) - Phase 1 correctness regressions (RefreshLock, sliding LastAccess, dependency cycles, etc.)
 - [NewApiTests.cs](mdc:CacheUtility.Tests/NewApiTests.cs) - Coverage for `GetAsync`, `GetAllByGroup<T>`, `TryGet<T>`
-- [PersistentCacheHardeningTests.cs](mdc:CacheUtility.Tests/PersistentCacheHardeningTests.cs) - Atomic writes, orphan cleanup, sliding-touch throttle
+- [PersistentCacheHardeningTests.cs](mdc:CacheUtility.Tests/PersistentCacheHardeningTests.cs) - Atomic writes, orphan cleanup, sliding-touch throttle, `Persist` across a simulated restart
+- [GroupRemovalRaceTests.cs](mdc:CacheUtility.Tests/GroupRemovalRaceTests.cs) - `RemoveGroup` racing populates and background refreshes (1.4.6)
+- [AsyncLambdaTaskCachingTests.cs](mdc:CacheUtility.Tests/AsyncLambdaTaskCachingTests.cs) / [TaskPopulateWarningTests.cs](mdc:CacheUtility.Tests/TaskPopulateWarningTests.cs) - Task-returning populates on the sync `Get` (1.4.1 deadlock fix and its warning)
+- [EvictionLoggingTests.cs](mdc:CacheUtility.Tests/EvictionLoggingTests.cs) - Eviction diagnostics
 - [TestCollectionConfig.cs](mdc:CacheUtility.Tests/TestCollectionConfig.cs) - Disables xUnit parallelization (the `Cache` class is static)
 
 ### Build & Packaging
 - Target framework: .NET 9.0
 - Dependencies: `System.Runtime.Caching`, `Microsoft.Extensions.Logging.Abstractions`, `Microsoft.Extensions.Hosting.Abstractions`, `System.Text.Json`
 - Configured for NuGet package generation on build (`GeneratePackageOnBuild`)
-- Current version: see `<Version>` in [CacheUtility.csproj](mdc:CacheUtility.csproj) (1.4.0 at the time of writing)
+- Current version: see `<Version>` in [CacheUtility.csproj](mdc:CacheUtility.csproj)
+- Released by merging into the `production` branch ([main.yml](mdc:.github/workflows/main.yml))
 
 ## Main Class: Cache
-The `Cache` class is `static` (not abstract — it cannot be instantiated). Public surface:
+`Cache` is declared `public abstract class` with only static members, so it cannot be instantiated. Public surface:
 
-- `Get<TData>(...)` / `GetAsync<TData>(...)` — retrieve or populate, with sync or async populate methods
-- `TryGet<TData>(key, group, out value)` — cache-only lookup, never populates
+- `Get<TData>(...)` / `GetAsync<TData>(...)` - retrieve or populate, with sync or async populate methods
+- `TryGet<TData>(key, group, out value)` - cache-only lookup, never populates
 - `Remove(key, group)`, `Remove(List<string>, group)`, `RemoveGroup(params string[])`, `RemoveAllButThese(...)`, `RemoveAll()`
-- `GetAllByGroup(group)` and `GetAllByGroup<TData>(group)` — bulk retrieval
-- `SetDependencies(group, params dependents)` — cascade-on-remove relationships
+- `GetAllByGroup(group)` and `GetAllByGroup<TData>(group)` - bulk retrieval
+- `SetDependencies(group, params dependents)` - cascade-on-remove relationships
+- `Persist(key, group)` - write an entry's current in-memory value to disk after an in-place change (1.4.7)
 - `EnablePersistentCache(...)`, `DisablePersistentCache()`, `IsPersistentCacheEnabled`, `GetPersistentCacheOptions()`, `GetPersistentCacheStatistics()`, `CleanupExpiredPersistentCache()`
-- `GetAllCacheMetadata()` — diagnostic snapshot of every cached item
-- `ConfigureLogging(ILoggerFactory)` — wire up logging in non-DI scenarios
+- `GetAllCacheMetadata()` - diagnostic snapshot of every cached item
+- `ConfigureLogging(ILoggerFactory)` - wire up logging in non-DI scenarios
 
 Internally, every cached value is wrapped in `Cache.CacheItem<T>` (which implements an internal `ICacheItem` interface, used to avoid reflection on hot paths like metadata enumeration and size estimation).
